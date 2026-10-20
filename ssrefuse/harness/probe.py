@@ -7,6 +7,13 @@ ends up overstating how well a filter works. The verdicts are:
 
   reached_internal  an internal canary marker came back, or the internal target
                     logged the hit -- the only verdict that counts as a bypass
+  reached_not_disclosed
+                    the request arrived at the internal service and the service
+                    did not hand over its secret. Header-gated cloud metadata is
+                    the case this exists for: the application's guard did not
+                    stop the request, the cloud's own mitigation did, and
+                    scoring that as either a bypass or a block would credit the
+                    wrong defender
   oob_confirmed     the out-of-band canary logged a DNS query or HTTP hit
   reached_benign    the fetch succeeded against the allowlisted partner host;
                     this is the control outcome, never a finding
@@ -31,6 +38,7 @@ import http.client
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -43,7 +51,15 @@ from ssrefuse import testbed_spec as spec
 from ssrefuse.corpus import REPO_ROOT, Corpus, Variant
 from ssrefuse.harness import payloads as payload_catalog
 
-INTERNAL_SERVICES = {"internal-admin", "internal-admin6", "metadata", "cgnat"}
+# Every service that counts as "inside". Kept as one set so that adding a
+# service to the testbed and forgetting it here cannot turn a reached target
+# into a quiet no_internal_contact.
+INTERNAL_SERVICES = {
+    "internal-admin", "internal-admin6", "metadata", "cgnat",
+    "metadata-ecs", "metadata-alibaba", "intranet",
+    "docker-api", "elasticsearch", "consul", "actuator",
+    "redis", "memcached",
+}
 PUBLIC_SERVICES = {"public-site", "oob-http"}
 RETRY_FAMILIES = {"B14_dns_rebinding": 6}   # time-of-check races need several tries
 
@@ -99,6 +115,15 @@ class LabProcess:
         cmd = [arg.replace("{port}", str(self.port)) for arg in self.app.start]
         if cmd[0] == "python":
             cmd[0] = self.python
+        elif not os.path.isabs(cmd[0]) and shutil.which(cmd[0]) is None:
+            # Said plainly here rather than left as a FileNotFoundError from
+            # Popen: an interpreter missing from the sandbox PATH is a setup
+            # problem, and it must not be mistaken for a lab that failed to
+            # start or, worse, for a run with one lab silently absent.
+            raise RuntimeError(
+                f"cannot start lab {self.app.name!r}: {cmd[0]!r} is not on PATH. "
+                f"The {self.app.lang} lab needs it; install it or run "
+                f"`ssrefuse probe --apps` with the labs that can run here.")
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         handle = open(self.log_path, "w")
         self.proc = subprocess.Popen(
@@ -250,13 +275,23 @@ def _classify(variant: Variant, payload, attempt: Attempt) -> tuple[str, str]:
     oob_hits = [row for row in attempt.log_rows
                 if row.get("service") in ("dns-oob", "oob-http")]
 
-    if payload.expect in ("internal", "metadata", "cgnat", "localfile"):
+    if payload.expected_marker in spec.INTERNAL_MARKERS:
         if attempt.marker_in_body == payload.expected_marker:
             return "reached_internal", (
                 f"canary {payload.expected_marker} present in the application's "
                 f"response (HTTP {attempt.status})")
         if internal_hits:
             services = sorted({row["service"] for row in internal_hits})
+            if not payload.discloses:
+                # The family said in advance that the service withholds its
+                # secret without a request header the attacker cannot set. The
+                # request still arrived, so this is neither a bypass nor a
+                # guard holding, and it gets its own verdict rather than being
+                # rounded to whichever of the two is nearer.
+                return "reached_not_disclosed", (
+                    f"{', '.join(services)} logged {len(internal_hits)} request(s), "
+                    f"and the service withheld {payload.expected_marker}: the "
+                    f"application did not stop this, the service did")
             return "reached_internal", (
                 f"no marker in body, but {', '.join(services)} logged "
                 f"{len(internal_hits)} request(s) during this probe")

@@ -250,3 +250,23 @@ def slice_python(path: str | Path, line: int, depth: int = 2,
             "calls into other modules were not expanded: "
             + ", ".join(result.unresolved_calls[:12]))
     return result
+
+
+JS_SUFFIXES = (".js", ".mjs", ".cjs", ".jsx")
+
+
+def slice_source(path: str | Path, line: int, **kwargs) -> CodeSlice:
+    """Slice whichever language the file is written in.
+
+    The judge asks for a slice of a location, not of a Python file, and the
+    corpus has more than one language in it. Dispatch lives here so that
+    forgetting a language shows up as a KeyError at the call site rather than
+    as a Python parser quietly failing on JavaScript and returning a window.
+    """
+    path = Path(path)
+    if path.suffix in JS_SUFFIXES:
+        from ssrefuse.slicing_js import slice_javascript
+        return slice_javascript(path, line, **kwargs)
+    if path.suffix in (".py", ".pyi"):
+        return slice_python(path, line, **kwargs)
+    raise ValueError(f"no slicer for {path.suffix!r} files ({path})")

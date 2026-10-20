@@ -29,9 +29,21 @@ A model handed a 450-line file spends its attention locating the sink. A model h
 function around it, the helpers that function calls, and the module constants those helpers compare
 against has nothing left to do but the reasoning. `ssrefuse/slicing.py` builds that slice from the
 Python AST: enclosing function, transitively called module-level functions up to a depth, module
-assignments referenced by any included code, and the imports.
+assignments referenced by any included code, and the imports. `slice_source` dispatches on the file
+extension and raises on one it has no slicer for, so a language added to the corpus cannot quietly
+fall through to the Python parser and come back as a fixed-size window.
 
-Two properties of the slice are load-bearing.
+`ssrefuse/slicing_js.py` produces the same shape for JavaScript without a parser, because adding one
+costs an npm tree. One character scan classifies every position as code, comment, string, template
+or regex, and both consumers read it: the comment stripper, and the bracket counter that finds
+top-level statement boundaries. The weakness of a scanner against a parser is handled by making it
+visible rather than by assuming it away. The one genuinely ambiguous construct in JavaScript
+lexing -- regex literal against division -- is resolved with the previous-token rule, stated in the
+module rather than buried. And the scan has a control: `tests/fixtures/js_scanner_control.js` holds
+the constructs it has to get right and the test asserts counts read off that fixture by hand, since
+a wrong statement count looks exactly like a right one.
+
+Three properties of the slice are load-bearing.
 
 It removes comments and docstrings. The lab sources are documented, and the documentation says which
 route is vulnerable and which technique defeats it. Benchmarks assembled from annotated code have
@@ -42,6 +54,12 @@ at line N still points at line N on disk.
 
 It records what it could not expand. Calls into other modules are listed in the prompt, and the judge
 is told it may answer `needs_dynamic_test` instead of guessing.
+
+It carries the values a guard compares against. A denylist or an allowlist is a module-level
+constant in both labs, and a judgement about a guard made without the contents of the list it
+consults is a judgement about the shape of the code. Both slicers pull in every module value any
+included code refers to, including values referenced only from inside a template substitution,
+which is why the JavaScript scan classifies `${...}` as code rather than as string.
 
 ## Letting the judge ask back
 
@@ -90,7 +108,8 @@ the measurement engine is already source-agnostic.
 ssrefuse/
   testbed_spec.py        addresses, ports, DNS zone, canary markers
   corpus.py              ground truth loading, marker scanning, attribution
-  slicing.py             AST slicing and annotation stripping
+  slicing.py             AST slicing, annotation stripping, language dispatch
+  slicing_js.py          JavaScript scanner: lexing, statement bounds, slicing
   harness/
     sandbox.py           builds the namespace, runs one job inside it
     inside.py            namespace setup, isolation controls, job dispatch
@@ -107,7 +126,8 @@ ssrefuse/
     static.py            TP/FP/FN/TN, unattributed accounting
   llm/                   client, cache, prompts
   reporting/tables.py    markdown tables
-rules/semgrep/           three detector configurations
+rules/semgrep/           three detector tiers, one rule file per language
 corpus/                  labs, ground truth, static-only fixtures
-tests/                   47 tests, including the sandbox isolation proof
+tests/                   87 tests, including the sandbox isolation proof
+                         and the JavaScript scanner control
 ```

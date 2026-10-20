@@ -21,7 +21,8 @@ from ssrefuse.harness import payloads as catalog
 
 # Strongest-evidence-wins order when several concrete values share a family.
 VERDICT_RANK = {
-    "reached_internal": 5,
+    "reached_internal": 6,
+    "reached_not_disclosed": 5,
     "oob_confirmed": 4,
     "reached_benign": 3,
     "no_internal_contact": 2,
@@ -32,6 +33,7 @@ VERDICT_RANK = {
 
 CELL_SYMBOL = {
     "reached_internal": "X",
+    "reached_not_disclosed": "!",
     "oob_confirmed": "o",
     "reached_benign": "=",
     "no_internal_contact": ".",
@@ -42,6 +44,8 @@ CELL_SYMBOL = {
 
 CELL_LEGEND = [
     ("X", "reached an internal target: bypass confirmed"),
+    ("!", "reached the internal service, which withheld its secret: the service "
+          "stopped this, not the application"),
     ("-", "the application refused the input"),
     ("e", "the fetch was attempted and failed in the client"),
     (".", "the fetch happened but no internal target was reached"),

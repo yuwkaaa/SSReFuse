@@ -1,0 +1,58 @@
+# The same taint rule with the validation shapes a reviewer would reach for
+# declared as sanitizers: compare the parsed hostname, or classify the resolved
+# address. Both are necessary and neither is sufficient, so this configuration
+# is expected to lose the variants whose guard has the right shape and the wrong
+# effect. It is included to measure that loss rather than to assert it.
+rules:
+  - id: ssrefuse-js-taint-naive
+    mode: taint
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      A request-controlled value reaches an outbound request sink without
+      passing any hostname or address validation this configuration recognises.
+    metadata:
+      ssrefuse-detector: taint-naive
+      ssrefuse-lang: javascript
+    pattern-sources:
+      - pattern: $REQ.query.$P
+      - pattern: $REQ.query[...]
+      - pattern: $REQ.body.$P
+      - pattern: $REQ.body[...]
+      - pattern: $REQ.params.$P
+      - pattern: $REQ.params[...]
+      - pattern: $REQ.headers[...]
+      - pattern: $REQ.cookies.$P
+    pattern-sanitizers:
+      - pattern: new URL(...).hostname
+      - pattern: url.parse(...).hostname
+      - pattern: legacyUrl.parse(...).hostname
+      - pattern: dns.promises.lookup(...)
+      - pattern: dns.lookup(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: fetch($URL, ...)
+              - pattern: undici.fetch($URL, ...)
+              - pattern: undici.request($URL, ...)
+              - pattern: axios($URL, ...)
+              - pattern: got($URL, ...)
+          - focus-metavariable: $URL
+      # Clients addressed by method name keep their own block: a
+      # metavariable-regex placed beside a pattern-either discards every
+      # alternative that does not bind that metavariable.
+      - patterns:
+          - pattern-either:
+              - pattern: http.$M($URL, ...)
+              - pattern: https.$M($URL, ...)
+              - pattern: axios.$M($URL, ...)
+              - pattern: got.$M($URL, ...)
+          - focus-metavariable: $URL
+          - metavariable-regex:
+              metavariable: $M
+              regex: ^(get|post|put|patch|delete|head|options|request|stream)$
+      - patterns:
+          - pattern-either:
+              - pattern: execFile("curl", [...,$URL,...], ...)
+              - pattern: spawn("curl", [...,$URL,...], ...)
+          - focus-metavariable: $URL

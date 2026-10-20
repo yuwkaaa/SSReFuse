@@ -37,6 +37,8 @@ meta:
     G10_regex_unanchored: allowlist expressed as a pattern that is not anchored at the end
     G11_guard_wrong_value: a correct check applied to a value other than the one fetched
     G12_path_concat_unvalidated: URL assembled from a fixed host and an unvalidated path
+    G13_denylist_host_legacy_parser: hostname denylist applied to the output of a
+      parser that does not canonicalise the authority
   flows:
     F0_direct: source and sink in the same function
     F1_interprocedural: taint passes through a helper function
@@ -51,6 +53,12 @@ apps:
     start: ["python", "corpus/labs/flask_ssrf/app.py", "{port}"]
     ready_marker: LAB-READY
     framework: flask
+  node_ssrf:
+    lang: javascript
+    file: corpus/labs/node_ssrf/app.js
+    start: ["node", "corpus/labs/node_ssrf/app.js", "{port}"]
+    ready_marker: LAB-READY
+    framework: node-http
 
 variants:
   - id: py-001
@@ -61,7 +69,15 @@ variants:
     observability: reflected
     label: vulnerable
     entry: {method: GET, path: /preview/direct, inject: query, param: url, payload_kind: url}
-    bypasses_declared: [B01_plain_loopback, B07_dns_to_internal, B15_metadata_service, B16_cgnat_range]
+    bypasses_declared: [B01_plain_loopback, B07_dns_to_internal, B15_metadata_service,
+                        B16_cgnat_range, B24_internal_service_range, B25_rfc1918_host]
+    notes: >
+      B24 and B25 are declared here because a route with no guard is where the
+      reachable surface should be stated in full: not one admin endpoint but
+      every port behind the loopback address and every host on the private
+      network. B30 is deliberately absent and must stay absent: header-gated
+      metadata is never scored as a bypass, so declaring it would be a
+      permanent unreproducible declaration.
 
   - id: py-002
     app: flask_ssrf
@@ -224,7 +240,9 @@ variants:
     observability: reflected
     label: vulnerable
     entry: {method: GET, path: /preview/scheme-only, inject: query, param: url, payload_kind: url}
-    bypasses_declared: [B01_plain_loopback, B15_metadata_service]
+    bypasses_declared: [B01_plain_loopback, B15_metadata_service,
+                        B24_internal_service_range, B25_rfc1918_host]
+    notes: a scheme check says nothing about which address or which port is behind it
 
   - id: py-016
     app: flask_ssrf
@@ -245,8 +263,13 @@ variants:
     observability: reflected
     label: vulnerable
     entry: {method: GET, path: /preview/httpx, inject: query, param: url, payload_kind: url}
-    bypasses_declared: [B03_decimal_ip, B07_dns_to_internal]
-    notes: same guard as py-007 behind a different client library
+    bypasses_declared: [B03_decimal_ip, B07_dns_to_internal, B25_rfc1918_host,
+                        B27_unicode_authority]
+    notes: >
+      Same guard as py-007 behind a different client library, and B27 is where
+      that stops being a formality: requests refuses an authority written with
+      ideographic full stops, httpx sends it, and the address it resolves to is
+      loopback. The guard is identical in both routes.
 
   - id: py-018
     app: flask_ssrf
@@ -256,8 +279,15 @@ variants:
     observability: reflected
     label: vulnerable
     entry: {method: GET, path: /preview/curl, inject: query, param: url, payload_kind: url}
-    bypasses_declared: [B01_plain_loopback]
-    notes: the fetch leaves the process entirely, so library-level rules see nothing
+    bypasses_declared: [B01_plain_loopback, B22_gopher_scheme, B23_dict_scheme,
+                        B24_internal_service_range, B25_rfc1918_host,
+                        B27_unicode_authority]
+    notes: >
+      The fetch leaves the process entirely, so library-level rules see nothing
+      and the protocol surface is curl's rather than the language's. B22 and
+      B23 are declared only here and on js-018: gopher and dict are what turn
+      an SSRF into writes against Redis in production, and no library sink in
+      either lab speaks them.
 
   - id: py-019
     app: flask_ssrf
@@ -328,5 +358,336 @@ variants:
       Only the path is attacker-controlled and the validation rejects every
       character that could end the path component and take over the authority,
       which the B09 and B20 path payloads exercise directly.
+    entry: {method: GET, path: /preview/path-only, inject: query, param: path, payload_kind: path}
+    bypasses_declared: []
+
+  # --- JavaScript lab ------------------------------------------------------
+  # Same guard taxonomy as the Python lab so the two can be compared row by
+  # row. Where a row differs, the runtime is the reason and the note says
+  # which runtime fact it is. Three of them drive most of the difference and
+  # each was measured, not assumed: new URL() canonicalises numeric and
+  # percent-encoded authorities, fetch() refuses a URL carrying credentials,
+  # and fetch() follows redirects while http.get() never does.
+
+  - id: js-001
+    app: node_ssrf
+    sink: fetch
+    guards: [G0_none]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/direct, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B01_plain_loopback, B07_dns_to_internal, B15_metadata_service,
+                        B16_cgnat_range, B24_internal_service_range, B25_rfc1918_host,
+                        B27_unicode_authority]
+    notes: >
+      B27 is declared on the JavaScript side and not on the Python one. Both
+      runtimes resolve an ideographic-full-stop authority to loopback, but
+      requests rejects the URL before sending it, so on py-001 the cell is a
+      sink error. py-017 (httpx) and py-018 (curl) are where the same payload
+      reaches an internal target in Python.
+
+  - id: js-002
+    app: node_ssrf
+    sink: fetch
+    guards: [G0_none]
+    flow: F0_direct
+    observability: blind
+    label: vulnerable
+    entry: {method: GET, path: /preview/blind, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B01_plain_loopback]
+    notes: >
+      The response body is discarded, so only the access log and the DNS log
+      can confirm a hit.
+
+  - id: js-003
+    app: node_ssrf
+    sink: fetch
+    guards: [G0_none]
+    flow: F1_interprocedural
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/helper, inject: query, param: url, payload_kind: url}
+    uses_shared: [shared.fetchRemote]
+    bypasses_declared: [B01_plain_loopback]
+
+  - id: js-004
+    app: node_ssrf
+    sink: fetch
+    guards: [G0_none]
+    flow: F2_container
+    observability: reflected
+    label: vulnerable
+    entry: {method: POST, path: /preview/json, inject: json, json_path: source.href, payload_kind: url}
+    uses_shared: [shared.fetchRemote]
+    bypasses_declared: [B01_plain_loopback]
+
+  - id: js-005
+    app: node_ssrf
+    sink: http.get
+    guards: [G12_path_concat_unvalidated]
+    flow: F3_assembled
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/assembled, inject: query, param: host, payload_kind: host}
+    bypasses_declared: [B01_plain_loopback, B07_dns_to_internal, B10_subdomain_suffix]
+
+  - id: js-006
+    app: node_ssrf
+    sink: fetch
+    guards: [G1_denylist_substring]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/denylist-string, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B02_loopback_alias, B03_decimal_ip, B04_octal_ip, B05_hex_ip,
+                        B06_ipv6_loopback, B07_dns_to_internal, B16_cgnat_range,
+                        B19_encoded_host, B25_rfc1918_host, B27_unicode_authority]
+    notes: >
+      B19 is declared here and not on the Python substring denylist, which is
+      the point of having both: the guard reads the raw text either way, and in
+      Node the sink decodes the percent-encoded authority back to the address
+      the denylist was written for.
+
+  - id: js-007
+    app: node_ssrf
+    sink: fetch
+    guards: [G13_denylist_host_legacy_parser]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/denylist-host-legacy, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B02_loopback_alias, B03_decimal_ip, B04_octal_ip, B05_hex_ip,
+                        B06_ipv6_loopback, B07_dns_to_internal, B08_trailing_dot,
+                        B16_cgnat_range, B19_encoded_host, B25_rfc1918_host,
+                        B27_unicode_authority, B28_slash_confusion]
+    notes: >
+      Pairs with js-008: identical denylist, identical sink, different parser.
+      The legacy parser returns the authority as written, so the comparison is
+      against a string the attacker chose the spelling of.
+
+  - id: js-008
+    app: node_ssrf
+    sink: fetch
+    guards: [G2_denylist_host]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/denylist-host, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B06_ipv6_loopback, B07_dns_to_internal, B08_trailing_dot,
+                        B16_cgnat_range, B25_rfc1918_host]
+    notes: >
+      The WHATWG parser canonicalises the authority before the comparison, so
+      the numeric-spelling families collapse onto a denylist entry and stop
+      working. What is left is everything a denylist cannot know about: a name,
+      a trailing dot, a bracketed IPv6 literal, and an address range nobody
+      wrote down. Same guard class as py-007, far fewer columns.
+
+  - id: js-009
+    app: node_ssrf
+    sink: http.get
+    guards: [G3_allowlist_prefix]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/allow-prefix, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B09_userinfo_confusion, B10_subdomain_suffix]
+    notes: >
+      Uses http.get deliberately. The same guard in front of fetch loses the
+      userinfo family, because fetch refuses a URL carrying credentials, and
+      js-010 is there to show that half of the pair.
+
+  - id: js-010
+    app: node_ssrf
+    sink: fetch
+    guards: [G4_allowlist_substring]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/allow-substring, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B10_subdomain_suffix, B11_query_confusion, B12_fragment_confusion]
+    notes: >
+      B09 is not declared although the guard does not stop it: fetch rejects
+      the URL before a request is sent. The cell is a sink_error, not a block,
+      and the matrix keeps those apart.
+
+  - id: js-011
+    app: node_ssrf
+    sink: fetch
+    guards: [G10_regex_unanchored]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/allow-regex, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B10_subdomain_suffix]
+
+  - id: js-012
+    app: node_ssrf
+    sink: fetch
+    guards: [G5_allowlist_host_redirects]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/allow-host-redirects, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B13_redirect]
+    notes: following redirects is the default in fetch, so this variant is what an app gets by writing nothing
+
+  - id: js-013
+    app: node_ssrf
+    sink: fetch
+    guards: [G6_allowlist_host_noredirect, G9_scheme_only]
+    flow: F0_direct
+    observability: reflected
+    label: safe
+    why_safe: >
+      The hostname is compared for equality after WHATWG parsing and redirects
+      are refused with redirect:'manual', so the only reachable host is the
+      allowlisted partner. Reaching an internal target would require that name
+      to resolve internally, which the testbed zone does not do.
+    entry: {method: GET, path: /preview/allow-host-noredirect, inject: query, param: url, payload_kind: url}
+    bypasses_declared: []
+
+  - id: js-014
+    app: node_ssrf
+    sink: fetch
+    guards: [G7_resolve_check_public, G9_scheme_only]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/resolve-check, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B14_dns_rebinding]
+    notes: dns.lookup decides the check, undici resolves again for the connection
+
+  - id: js-015
+    app: node_ssrf
+    sink: http.get
+    guards: [G8_resolve_pin_connect, G9_scheme_only]
+    flow: F0_direct
+    observability: reflected
+    label: safe
+    why_safe: >
+      One lookup decides both the check and the connection: the validated
+      address is handed to the socket as a lookup function that can return
+      nothing else, the hostname still travels in the Host header, and http.get
+      does not follow redirects. There is no second lookup to win. The route
+      still fetches arbitrary public URLs, which is the feature working as
+      intended; the label is about internal reach, so reaching the out-of-band
+      canary from here is expected and is not counted as a bypass.
+    entry: {method: GET, path: /preview/resolve-pin, inject: query, param: url, payload_kind: url}
+    bypasses_declared: []
+
+  - id: js-016
+    app: node_ssrf
+    sink: fetch
+    guards: [G9_scheme_only]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/scheme-only, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B01_plain_loopback, B15_metadata_service,
+                        B24_internal_service_range, B25_rfc1918_host,
+                        B27_unicode_authority]
+    notes: a scheme check says nothing about which address or which port is behind it
+
+  - id: js-017
+    app: node_ssrf
+    sink: http.get
+    guards: [G0_none]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/httpget, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B01_plain_loopback, B09_userinfo_confusion]
+    notes: >
+      The sink that accepts credentials in the URL. B17 is not declared: unlike
+      urllib in the Python lab, neither http.get nor fetch has a file handler,
+      so a negative there is about the sink and not about a guard.
+
+  - id: js-018
+    app: node_ssrf
+    sink: execFile+curl
+    guards: [G0_none]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/curl, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B01_plain_loopback, B22_gopher_scheme, B23_dict_scheme,
+                        B24_internal_service_range, B25_rfc1918_host,
+                        B27_unicode_authority]
+    notes: >
+      The fetch leaves the process entirely, so library-level rules see nothing
+      and the protocol surface is curl's rather than the language's.
+
+  - id: js-019
+    app: node_ssrf
+    sink: none
+    guards: []
+    flow: F4_stored
+    observability: reflected
+    label: safe
+    why_safe: >
+      This route only writes the URL into module state. No request-sending call
+      is reachable from it, so a finding anchored here is a false positive even
+      though the value it stores is later fetched by js-020.
+    entry: {method: POST, path: /preview/enqueue, inject: json, json_path: url, payload_kind: url}
+    bypasses_declared: []
+    no_sink: true
+
+  - id: js-020
+    app: node_ssrf
+    sink: fetch
+    guards: [G0_none]
+    flow: F4_stored
+    observability: reflected
+    label: vulnerable
+    entry:
+      steps:
+        - {method: POST, path: /preview/enqueue, inject: json, json_path: url, payload_kind: url,
+           capture: {job_id: job_id}}
+        - {method: GET, path: "/preview/run/{job_id}"}
+    bypasses_declared: [B01_plain_loopback]
+    notes: second-order flow; nothing tainted appears inside the sink function
+
+  - id: js-021
+    app: node_ssrf
+    sink: http.get
+    guards: [G11_guard_wrong_value]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/checked-wrong-value, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B21_decoded_delimiter]
+    notes: >
+      The check parses a decoded copy and the fetch uses the raw value. The sink
+      is http.get because the payload carries credentials and fetch would refuse
+      it before the guard's mistake could matter.
+
+  - id: js-022
+    app: node_ssrf
+    sink: fetch
+    guards: []
+    flow: F0_direct
+    observability: reflected
+    label: safe
+    why_safe: >
+      The URL is a module constant. No request parameter, header or body field
+      reaches this call, so there is no attacker-controlled input at all.
+    entry: {method: GET, path: /status/upstream, inject: none, payload_kind: none}
+    bypasses_declared: []
+    no_user_input: true
+
+  - id: js-023
+    app: node_ssrf
+    sink: http.get
+    guards: [G12_path_concat_unvalidated]
+    flow: F3_assembled
+    observability: reflected
+    label: safe
+    why_safe: >
+      Only the path is attacker-controlled and the validation rejects every
+      character that could end the path component and take over the authority.
+      The sink is http.get, which does accept a URL carrying credentials, so
+      the B09 and B20 path payloads are stopped by the guard and not by the
+      client refusing to send them.
     entry: {method: GET, path: /preview/path-only, inject: query, param: path, payload_kind: path}
     bypasses_declared: []

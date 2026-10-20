@@ -21,7 +21,7 @@ from ssrefuse.corpus import REPO_ROOT, Corpus
 from ssrefuse.detectors.base import Candidate
 from ssrefuse.llm.client import LLMClient
 from ssrefuse.llm.prompts import SYSTEM, build_prompt
-from ssrefuse.slicing import slice_python
+from ssrefuse.slicing import slice_source
 
 VERDICTS = ("vulnerable", "safe", "needs_dynamic_test")
 
@@ -31,6 +31,7 @@ class Judgement:
     file: str
     line: int
     detector: str
+    lang: str = ""
     verdict: str = "needs_dynamic_test"
     confidence: float = 0.0
     bypass_families: list[str] = field(default_factory=list)
@@ -45,6 +46,10 @@ class Judgement:
     model: str = ""
     is_mock: bool = False
     cached: bool = False
+    reasoning_effort: str = ""
+    reasoning_tokens: int = 0
+    reasoning_chars: int = 0
+    json_mode_refused: bool = False
     parse_error: str = ""
     raw: str = ""
 
@@ -81,13 +86,14 @@ class LLMJudge:
         hint = dict(hint or {})
         judgement = Judgement(file=file, line=line, detector=detector,
                               provider=self.client.provider, model=self.client.model,
-                              is_mock=self.client.is_mock)
+                              is_mock=self.client.is_mock,
+                              reasoning_effort=self.client.reasoning_effort)
         extra_functions: list[str] = []
         extra_values: list[str] = []
         previous: dict | None = None
 
         for round_number in range(1, self.max_rounds + 1):
-            code_slice = slice_python(
+            code_slice = slice_source(
                 REPO_ROOT / file if not str(file).startswith("/") else file,
                 line, depth=self.slice_depth, strip=self.strip_comments,
                 include_functions=extra_functions, include_values=extra_values)
@@ -95,6 +101,7 @@ class LLMJudge:
             hint["slice_notes"] = code_slice.notes
             hint["detector"] = detector
             prompt = build_prompt(code_slice.render(), hint, round_number, previous)
+            judgement.lang = str(hint.get("lang", ""))
 
             completion = self.client.complete(prompt, system=SYSTEM)
             answer, parse_note = _extract_json(completion.text)
@@ -103,6 +110,11 @@ class LLMJudge:
             judgement.slice_lines = code_slice.line_count()
             judgement.raw = completion.text
             judgement.cached = completion.cached
+            judgement.reasoning_effort = self.client.reasoning_effort
+            judgement.reasoning_tokens += completion.reasoning_tokens
+            judgement.reasoning_chars += len(completion.reasoning)
+            judgement.json_mode_refused = (judgement.json_mode_refused
+                                           or completion.json_mode_refused)
             judgement.parse_error = parse_note
             if not answer:
                 return judgement

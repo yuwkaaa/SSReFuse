@@ -1,10 +1,18 @@
 """Semgrep detector.
 
-The positive control is scanned in the same invocation as the corpus, not in a
-separate one: a rule file that fails to load, a semgrep upgrade that changes
-pattern semantics, or a typo in a metavariable all produce an empty result set,
-and the only cheap way to tell that apart from a clean corpus is to include a
-file whose answer is known.
+A detector here is a *tier* -- sink inventory, taint without sanitizers, taint
+with the sanitizers a reviewer would reach for -- and a tier spans every
+language in the corpus. One semgrep invocation per tier runs that tier's rule
+files for all languages together, so the numbers in the report compare tiers
+rather than rule files.
+
+The positive controls are scanned in the same invocation as the corpus, not in
+a separate one, and there is one per language. A rule file that fails to load,
+a semgrep upgrade that changes pattern semantics, or a typo in a metavariable
+all produce an empty result set, and the only cheap way to tell that apart from
+a clean codebase is to include files whose answer is known. Per language,
+because a tier whose Python rules work and whose JavaScript rules load nothing
+would still show a healthy total.
 """
 from __future__ import annotations
 
@@ -17,12 +25,38 @@ from pathlib import Path
 from ssrefuse.corpus import REPO_ROOT
 from ssrefuse.detectors.base import Candidate, DetectorRun
 
-CONTROL_FILE = REPO_ROOT / "tests" / "fixtures" / "positive_control_python.py"
-DEFAULT_CONFIGS = {
-    "inventory": REPO_ROOT / "rules" / "semgrep" / "python-inventory.yaml",
-    "taint-nosan": REPO_ROOT / "rules" / "semgrep" / "python-taint-nosan.yaml",
-    "taint-naive": REPO_ROOT / "rules" / "semgrep" / "python-taint-naive.yaml",
+RULES = REPO_ROOT / "rules" / "semgrep"
+FIXTURES = REPO_ROOT / "tests" / "fixtures"
+
+CONTROL_FILES = [
+    FIXTURES / "positive_control_python.py",
+    FIXTURES / "positive_control_javascript.js",
+]
+
+DEFAULT_CONFIGS: dict[str, list[Path]] = {
+    "inventory": [RULES / "python-inventory.yaml", RULES / "js-inventory.yaml"],
+    "taint-nosan": [RULES / "python-taint-nosan.yaml", RULES / "js-taint-nosan.yaml"],
+    "taint-naive": [RULES / "python-taint-naive.yaml", RULES / "js-taint-naive.yaml"],
 }
+
+# The sink-inventory pass over the static-only corpus is a separate run, with
+# separate targets and separate controls, because what it produces is a
+# different measurement. The labelled corpus is scored for precision and
+# recall against labels the prober reproduced. PHP and Java have no runnable
+# lab here, so they have no such labels, and mixing their findings into that
+# table would be scoring a claim nobody tested. What they can answer without
+# running is "which sinks does the rule see", and that is all this run is for.
+SINK_CONFIGS: list[Path] = [
+    RULES / "python-inventory.yaml", RULES / "js-inventory.yaml",
+    RULES / "php-inventory.yaml", RULES / "java-inventory.yaml",
+]
+SINK_CONTROLS: list[Path] = [
+    FIXTURES / "positive_control_python.py",
+    FIXTURES / "positive_control_javascript.js",
+    FIXTURES / "positive_control_php.php",
+    FIXTURES / "PositiveControlJava.java",
+]
+STATIC_ONLY = REPO_ROOT / "corpus" / "static_only"
 
 
 def semgrep_binary() -> str:
@@ -35,11 +69,16 @@ def semgrep_binary() -> str:
         "`.venv/bin/pip install semgrep`, or put it on PATH.")
 
 
-def run_semgrep(detector: str, config: Path, targets: list[Path],
+def run_semgrep(detector: str, configs: list[Path], targets: list[Path],
+                controls: list[Path] | None = None,
                 timeout: float = 600.0) -> DetectorRun:
     binary = semgrep_binary()
-    scan_targets = [str(t) for t in targets] + [str(CONTROL_FILE)]
-    cmd = [binary, "scan", "--config", str(config), "--json", "--quiet",
+    controls = list(controls if controls is not None else CONTROL_FILES)
+    scan_targets = [str(t) for t in targets] + [str(c) for c in controls]
+    config_args: list[str] = []
+    for config in configs:
+        config_args += ["--config", str(config)]
+    cmd = [binary, "scan", *config_args, "--json", "--quiet",
            "--metrics", "off", "--no-git-ignore", "--disable-version-check",
            *scan_targets]
     started = time.time()
@@ -47,8 +86,14 @@ def run_semgrep(detector: str, config: Path, targets: list[Path],
                           cwd=str(REPO_ROOT))
     duration = time.time() - started
 
-    run = DetectorRun(detector=detector, config=str(config.relative_to(REPO_ROOT)),
-                      duration_s=duration, control_file=str(CONTROL_FILE))
+    run = DetectorRun(
+        detector=detector,
+        config=", ".join(str(c.relative_to(REPO_ROOT)) for c in configs),
+        duration_s=duration,
+        # Seeded at zero so a control file that produced nothing is reported as
+        # a silent control rather than simply being absent from the mapping.
+        control_by_file={c.name: 0 for c in controls},
+    )
     try:
         report = json.loads(proc.stdout or "{}")
     except json.JSONDecodeError:
@@ -60,11 +105,12 @@ def run_semgrep(detector: str, config: Path, targets: list[Path],
         run.errors.append(f"{error.get('type', 'error')}: {error.get('message', '')[:200]}")
     run.scanned_files = len(report.get("paths", {}).get("scanned", []))
 
-    control_name = CONTROL_FILE.name
+    control_names = {c.name for c in controls}
     for finding in report.get("results", []):
         path = finding.get("path", "")
-        if Path(path).name == control_name:
-            run.control_findings += 1
+        name = Path(path).name
+        if name in control_names:
+            run.control_by_file[name] += 1
             continue
         extra = finding.get("extra", {})
         run.candidates.append(Candidate(
@@ -75,13 +121,20 @@ def run_semgrep(detector: str, config: Path, targets: list[Path],
             message=(extra.get("message", "") or "").strip()[:300],
             sink=(extra.get("lines", "") or "").strip()[:160],
             confidence=extra.get("metadata", {}).get("confidence", ""),
-            extra={"severity": extra.get("severity", "")},
+            extra={"severity": extra.get("severity", ""),
+                   "lang": extra.get("metadata", {}).get("ssrefuse-lang", "")},
         ))
     return run
 
 
 def run_all(targets: list[Path] | None = None,
-            configs: dict[str, Path] | None = None) -> list[DetectorRun]:
+            configs: dict[str, list[Path]] | None = None) -> list[DetectorRun]:
     targets = targets or [REPO_ROOT / "corpus" / "labs"]
     configs = configs or DEFAULT_CONFIGS
-    return [run_semgrep(name, path, targets) for name, path in configs.items()]
+    return [run_semgrep(name, paths, targets) for name, paths in configs.items()]
+
+
+def run_sink_inventory(targets: list[Path] | None = None) -> DetectorRun:
+    """Sink inventory across all four languages, over the static-only corpus."""
+    return run_semgrep("sink-inventory", SINK_CONFIGS,
+                       targets or [STATIC_ONLY], controls=SINK_CONTROLS)

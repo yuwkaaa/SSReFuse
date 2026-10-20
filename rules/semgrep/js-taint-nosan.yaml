@@ -1,0 +1,52 @@
+# Interprocedural taint from a request parameter to an outbound request sink in
+# JavaScript, with no sanitizer declared. Everything the application does to
+# validate the URL is invisible to this configuration on purpose: it isolates
+# how much of the result comes from reachability alone, before any claim about
+# guards.
+rules:
+  - id: ssrefuse-js-taint-nosan
+    mode: taint
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      A request-controlled value reaches an outbound request sink. No validation
+      is modelled by this configuration.
+    metadata:
+      ssrefuse-detector: taint-nosan
+      ssrefuse-lang: javascript
+    pattern-sources:
+      - pattern: $REQ.query.$P
+      - pattern: $REQ.query[...]
+      - pattern: $REQ.body.$P
+      - pattern: $REQ.body[...]
+      - pattern: $REQ.params.$P
+      - pattern: $REQ.params[...]
+      - pattern: $REQ.headers[...]
+      - pattern: $REQ.cookies.$P
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: fetch($URL, ...)
+              - pattern: undici.fetch($URL, ...)
+              - pattern: undici.request($URL, ...)
+              - pattern: axios($URL, ...)
+              - pattern: got($URL, ...)
+          - focus-metavariable: $URL
+      # Clients addressed by method name keep their own block: a
+      # metavariable-regex placed beside a pattern-either discards every
+      # alternative that does not bind that metavariable.
+      - patterns:
+          - pattern-either:
+              - pattern: http.$M($URL, ...)
+              - pattern: https.$M($URL, ...)
+              - pattern: axios.$M($URL, ...)
+              - pattern: got.$M($URL, ...)
+          - focus-metavariable: $URL
+          - metavariable-regex:
+              metavariable: $M
+              regex: ^(get|post|put|patch|delete|head|options|request|stream)$
+      - patterns:
+          - pattern-either:
+              - pattern: execFile("curl", [...,$URL,...], ...)
+              - pattern: spawn("curl", [...,$URL,...], ...)
+          - focus-metavariable: $URL

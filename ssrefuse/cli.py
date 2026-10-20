@@ -16,11 +16,17 @@ from pathlib import Path
 from ssrefuse import testbed_spec as spec
 from ssrefuse.corpus import REPO_ROOT, Corpus
 from ssrefuse.harness.payloads import FAMILY_BY_ID, summary as catalog_summary
+from ssrefuse.llm.client import REASONING_EFFORTS
 
 RESULTS = REPO_ROOT / "results"
 PROBE_RESULT = RESULTS / "probe" / "result.json"
 STATIC_RESULT = RESULTS / "static-runs.json"
+SINK_RESULT = RESULTS / "sink-inventory.json"
 JUDGE_RESULT = RESULTS / "llm-judgements.json"
+# One file per ablation arm. A single shared path means the second arm
+# overwrites the first, which costs the money for a run whose result is gone
+# and leaves an ablation table with one row in it.
+JUDGE_DIR = RESULTS / "judge"
 VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
 
 
@@ -81,20 +87,40 @@ def cmd_probe(args) -> int:
 
 
 def cmd_scan(args) -> int:
-    from ssrefuse.detectors.semgrep_runner import run_all
+    from ssrefuse.detectors.semgrep_runner import run_all, run_sink_inventory
     targets = [Path(t) for t in args.targets] if args.targets else None
     runs = run_all(targets=targets)
     STATIC_RESULT.parent.mkdir(parents=True, exist_ok=True)
     STATIC_RESULT.write_text(json.dumps([r.as_dict() for r in runs], indent=2))
+
+    # The static-only pass is kept in its own file as well as its own run, so
+    # that a reader who loads the scored results cannot accidentally pick up
+    # findings from files that have no labels behind them.
+    sink_run = run_sink_inventory()
+    SINK_RESULT.write_text(json.dumps(sink_run.as_dict(), indent=2))
+    runs = runs + [sink_run]
     failed = False
     for run in runs:
-        print(f"{run.detector:14} {run.status():50} candidates={len(run.candidates):3} "
-              f"control={run.control_findings} files={run.scanned_files} "
-              f"{run.duration_s:.1f}s")
+        controls = " ".join(f"{name}={count}"
+                            for name, count in sorted(run.control_by_file.items()))
+        print(f"{run.detector:14} {run.status():58} candidates={len(run.candidates):3} "
+              f"files={run.scanned_files} {run.duration_s:.1f}s")
+        print(f"               controls: {controls}")
         for error in run.errors[:5]:
             print(f"    {error[:160]}")
         failed = failed or not run.usable
-    print(f"\nwrote {STATIC_RESULT}")
+
+    from ssrefuse.evaluation import sinks
+    entries = sinks.coverage(sink_run.candidates)
+    counts = sinks.totals(entries)
+    print(f"\nsink inventory over corpus/static_only: {counts['found']} of "
+          f"{counts['expected']} marked sinks found, {counts['missed']} missed, "
+          f"{counts['unmarked']} reported without a marker")
+    for entry in entries:
+        if entry.missed or entry.unmarked:
+            print(f"    {entry.file}: missed={entry.missed or '-'} "
+                  f"unmarked_lines={entry.unmarked or '-'}")
+    print(f"wrote {STATIC_RESULT} and {SINK_RESULT}")
     return 1 if failed else 0
 
 
@@ -103,10 +129,9 @@ def _load_static_runs() -> list:
     runs = []
     for raw in json.loads(STATIC_RESULT.read_text()):
         run = DetectorRun(detector=raw["detector"], config=raw["config"],
-                          control_findings=raw["control_findings"],
+                          control_by_file=raw.get("control_by_file", {}),
                           errors=raw["errors"], duration_s=raw["duration_s"],
-                          scanned_files=raw["scanned_files"],
-                          control_file=raw.get("control_file", ""))
+                          scanned_files=raw["scanned_files"])
         run.candidates = [Candidate(**item) for item in raw["candidates"]]
         runs.append(run)
     return runs
@@ -134,6 +159,7 @@ def cmd_judge(args) -> int:
 
     client = LLMClient(provider=args.provider, model=args.model,
                        temperature=args.temperature,
+                       reasoning_effort=args.effort,
                        cache=ResponseCache(enabled=not args.no_cache))
     try:
         client.check_ready()
@@ -145,18 +171,42 @@ def cmd_judge(args) -> int:
               "labelled as such, and it must not be read as a measurement.",
               file=sys.stderr)
 
+    import time as _time
+    started = _time.time()
     corpus = Corpus()
+    candidates = source.candidates
+    if args.limit:
+        # Deterministic: candidates are sorted by file and line inside the
+        # judge, so the same --limit always takes the same locations. A capped
+        # run is NOT comparable with a full one and the payload records that,
+        # because a cheaper arm that scored differently for want of rows is
+        # the easiest wrong conclusion available here.
+        candidates = sorted(candidates, key=lambda c: (c.file, c.line))[:args.limit]
+        print(f"--limit {args.limit}: judging {len(candidates)} of "
+              f"{len(source.candidates)} candidates. This run is a sample and is "
+              f"not comparable with a full one.", file=sys.stderr)
     judge = LLMJudge(client, max_rounds=args.rounds,
                      strip_comments=not args.keep_comments)
-    judgements = judge.judge_candidates(source.candidates, corpus)
+    judgements = judge.judge_candidates(candidates, corpus)
 
     payload = {"client": client.describe(),
                "candidates_from": args.candidates_from,
+               "candidates_judged": len(candidates),
+               "candidates_available": len(source.candidates),
+               "is_sample": bool(args.limit),
+               "duration_s": round(_time.time() - started, 1),
                "max_rounds": args.rounds,
+               "reasoning_effort": args.effort,
                "comments_stripped": not args.keep_comments,
                "judgements": [j.as_dict() for j in judgements]}
     JUDGE_RESULT.parent.mkdir(parents=True, exist_ok=True)
     JUDGE_RESULT.write_text(json.dumps(payload, indent=2))
+    JUDGE_DIR.mkdir(parents=True, exist_ok=True)
+    arm = (f"{client.provider}_{client.model}_effort-{args.effort}"
+           f"_r{args.rounds}" + (f"_sample{args.limit}" if args.limit else "")
+           ).replace("/", "-")
+    arm_path = JUDGE_DIR / f"{arm}.json"
+    arm_path.write_text(json.dumps(payload, indent=2))
 
     counts: dict[str, int] = {}
     for judgement in judgements:
@@ -170,20 +220,42 @@ def cmd_judge(args) -> int:
         print(f"{len(errors)} answer(s) needed repair or could not be parsed:")
         for judgement in errors[:5]:
             print(f"  {judgement.file}:{judgement.line} {judgement.parse_error}")
+    refused = [j for j in judgements if j.json_mode_refused]
+    if refused:
+        print(f"{len(refused)} call(s) had to drop response_format and parse JSON "
+              f"out of prose; the endpoint refused json mode")
+    thinking = sum(j.reasoning_tokens for j in judgements)
+    if thinking:
+        print(f"reasoning tokens at effort={args.effort}: {thinking}")
     print(f"client: {client.describe()}")
-    print(f"wrote {JUDGE_RESULT}")
+    print(f"wrote {arm_path}")
     return 0
 
 
-def _load_judgements():
+def _judgements_from(payload: dict):
     from ssrefuse.detectors.llm_judge import Judgement
+    fields = set(Judgement.__dataclass_fields__)
+    return [Judgement(**{k: v for k, v in item.items() if k in fields})
+            for item in payload["judgements"]]
+
+
+def _load_judgements():
+    from ssrefuse.detectors.llm_judge import Judgement  # noqa: F401 - shared fields
     if not JUDGE_RESULT.exists():
         return None, []
     payload = json.loads(JUDGE_RESULT.read_text())
-    fields = set(Judgement.__dataclass_fields__)
-    judgements = [Judgement(**{k: v for k, v in item.items() if k in fields})
-                  for item in payload["judgements"]]
-    return payload, judgements
+    return payload, _judgements_from(payload)
+
+
+def _load_arms() -> list[tuple[str, dict, list]]:
+    """Every ablation arm on disk, newest last. Each is one judge run."""
+    if not JUDGE_DIR.exists():
+        return []
+    arms = []
+    for path in sorted(JUDGE_DIR.glob("*.json")):
+        payload = json.loads(path.read_text())
+        arms.append((path.stem, payload, _judgements_from(payload)))
+    return arms
 
 
 def cmd_report(args) -> int:
@@ -226,11 +298,39 @@ def cmd_report(args) -> int:
             "",
             tables.per_variant_detection(corpus, static_evals),
             "",
+            "## Bypass technique against rule",
+            "",
+            "The deliverable the brief asks for. The bypass matrix says which",
+            "technique got through; the detector table says which route a rule",
+            "flagged; this one crosses them.",
+            "",
+            tables.bypass_versus_rule(corpus, dyn, static_evals),
+            "",
         ]
     else:
         sections += ["## Static detectors", "",
                      "Not run. `ssrefuse scan` has not been executed, so this report",
                      "says nothing about static detection.", ""]
+
+    if SINK_RESULT.exists():
+        from ssrefuse.detectors.base import Candidate
+        from ssrefuse.evaluation import sinks
+        raw = json.loads(SINK_RESULT.read_text())
+        candidates = [Candidate(**item) for item in raw["candidates"]]
+        entries = sinks.coverage(candidates)
+        sections += [
+            "## Sink inventory per language",
+            "",
+            "Scored apart from everything above, and deliberately not as precision",
+            "and recall. The static-only corpus has no runnable lab behind it, so",
+            "it has no label a prober confirmed, and calling one of its functions",
+            "vulnerable because it looks vulnerable is the thing this project does",
+            "not do. What can be measured without running anything is narrower:",
+            "of the sinks that are in the file, how many does the rule see.",
+            "",
+            tables.sink_inventory_table(entries, raw.get("status", "")),
+            "",
+        ]
 
     payload, judgements = _load_judgements()
     if judgements:
@@ -262,6 +362,20 @@ def cmd_report(args) -> int:
             tables.strategy_notes(strategies),
             "",
         ]
+        arms = _load_arms()
+        if len(arms) > 1 or (arms and not arms[0][1].get("client", {}).get("is_mock")):
+            runs_for_fuse = {run.detector: run for run in _load_static_runs()} \
+                if STATIC_RESULT.exists() else {}
+            sections += [
+                "### Ablation: the thinking budget",
+                "",
+                "One model, one prompt, one candidate set. The only thing that moves is",
+                "how much the model is allowed to think, which is a request parameter",
+                "rather than a model name, so a difference in these rows has one cause.",
+                "",
+                tables.ablation_table(arms, corpus, runs_for_fuse, dyn),
+                "",
+            ]
     else:
         sections += ["## LLM judge and fusion", "",
                      "Not run. `ssrefuse judge` has not been executed, so this",
@@ -316,14 +430,26 @@ def main(argv: list[str] | None = None) -> int:
 
     judge = sub.add_parser("judge", help="run the LLM judge over static candidates")
     judge.add_argument("--provider", default="deepseek",
-                       help="deepseek (default), openai-compatible, or mock")
+                       help="deepseek (default), openrouter, openai-compatible, or mock")
     judge.add_argument("--model", default=None,
-                       help="deepseek-chat or deepseek-reasoner")
+                       help="provider default if omitted; deepseek-flash or "
+                            "deepseek-v4-pro for the deepseek provider")
+    judge.add_argument("--effort", default="none", choices=REASONING_EFFORTS,
+                       help="thinking budget. 'off' disables thinking; 'none' "
+                            "sends no parameter and takes the provider default, "
+                            "which was measured to be thinking ON, so 'none' is "
+                            "not a non-thinking arm. The ablation is one model "
+                            "with the thinking budget moved: off vs high.")
     judge.add_argument("--rounds", type=int, default=2,
                        help="maximum rounds; >1 lets the judge ask for more code")
     judge.add_argument("--candidates-from", default="inventory",
                        help="which detector run supplies the candidate set")
     judge.add_argument("--temperature", type=float, default=0.0)
+    judge.add_argument("--limit", type=int, default=0,
+                       help="judge only the first N candidates, in a fixed "
+                            "order. For trying a prompt change cheaply. The "
+                            "result is marked as a sample and must not be "
+                            "compared with a full run.")
     judge.add_argument("--no-cache", action="store_true")
     judge.add_argument("--keep-comments", action="store_true",
                        help="do not strip comments and docstrings; for measuring "
@@ -343,15 +469,26 @@ def main(argv: list[str] | None = None) -> int:
                        help="also run the LLM judge (needs an API key)")
     every.add_argument("--provider", default="deepseek")
     every.add_argument("--model", default=None)
+    every.add_argument("--effort", default="none", choices=REASONING_EFFORTS)
     every.add_argument("--rounds", type=int, default=2)
     every.add_argument("--candidates-from", default="inventory")
     every.add_argument("--temperature", type=float, default=0.0)
+    every.add_argument("--limit", type=int, default=0)
     every.add_argument("--no-cache", action="store_true")
     every.add_argument("--keep-comments", action="store_true")
     every.add_argument("targets", nargs="*")
     every.set_defaults(func=cmd_all)
 
     args = parser.parse_args(argv)
+
+    # Before any command runs, so that a key in .env is live for `judge` and
+    # for `all --with-judge` alike. Values are never printed; the report names
+    # variables and says whether each was set here or already present.
+    from ssrefuse import env
+    report = env.load()
+    if report:
+        print(f"env: {env.describe(report)}", file=sys.stderr)
+
     return args.func(args)
 
 

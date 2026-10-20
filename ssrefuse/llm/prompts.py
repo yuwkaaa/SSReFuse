@@ -96,19 +96,21 @@ QUESTIONS = """Answer these in order. Each one is a field in the schema.
 
 def build_prompt(slice_text: str, variant_hint: dict, round_number: int = 1,
                  previous: dict | None = None) -> str:
+    lang = str(variant_hint.get("lang") or "python").lower()
+    fence = "javascript" if lang.startswith(("js", "javascript", "node")) else lang
     parts = [
         "## Code slice",
         "",
-        "Comments and docstrings have been removed. Line numbers are the real",
-        "line numbers of the file. `>>` marks the line a static detector flagged.",
+        "Comments have been removed. Line numbers are the real line numbers of",
+        "the file. `>>` marks the line a static detector flagged.",
         "",
-        "```python",
+        f"```{fence}",
         slice_text,
         "```",
         "",
         "## What is known from outside the slice",
         "",
-        f"- language: {variant_hint.get('lang', 'python')}",
+        f"- language: {lang}",
         f"- framework: {variant_hint.get('framework', 'unknown')}",
         f"- the flagged line came from: {variant_hint.get('detector', 'a static detector')}",
     ]

@@ -1,0 +1,71 @@
+# Sink inventory for JavaScript. No reasoning about where the URL came from:
+# this is the recall-oriented candidate generator the fused pipeline starts
+# from, and the baseline its precision is measured against.
+rules:
+  - id: ssrefuse-js-inventory-fetch
+    languages: [javascript, typescript]
+    severity: INFO
+    message: >-
+      Outbound request sink reached here. Whether the destination is
+      attacker-controlled is not decided by this rule.
+    metadata:
+      ssrefuse-detector: inventory
+      ssrefuse-lang: javascript
+    pattern-either:
+      - pattern: fetch(...)
+      - pattern: $W.fetch(...)
+      - pattern: undici.request(...)
+      - pattern: undici.fetch(...)
+
+  # Clients addressed by method name keep their own rule. Measured on the
+  # Python rules and true here as well: a metavariable-regex placed beside a
+  # pattern-either discards every alternative that does not bind that
+  # metavariable, which silently drops whole sink families.
+  - id: ssrefuse-js-inventory-client-method
+    languages: [javascript, typescript]
+    severity: INFO
+    message: >-
+      Outbound request sink reached here through an HTTP client library.
+    metadata:
+      ssrefuse-detector: inventory
+      ssrefuse-lang: javascript
+    patterns:
+      - pattern-either:
+          - pattern: http.$M(...)
+          - pattern: https.$M(...)
+          - pattern: axios.$M(...)
+          - pattern: got.$M(...)
+          - pattern: superagent.$M(...)
+          - pattern: needle.$M(...)
+      - metavariable-regex:
+          metavariable: $M
+          regex: ^(get|post|put|patch|delete|head|options|request|stream)$
+
+  - id: ssrefuse-js-inventory-callable-client
+    languages: [javascript, typescript]
+    severity: INFO
+    message: >-
+      Outbound request sink reached here through a client called directly.
+    metadata:
+      ssrefuse-detector: inventory
+      ssrefuse-lang: javascript
+    pattern-either:
+      - pattern: axios(...)
+      - pattern: got(...)
+      - pattern: request(...)
+      - pattern: nodeFetch(...)
+
+  - id: ssrefuse-js-inventory-subprocess-fetch
+    languages: [javascript, typescript]
+    severity: INFO
+    message: >-
+      A fetch delegated to an external binary. Library-level rules cannot see
+      this sink at all.
+    metadata:
+      ssrefuse-detector: inventory
+      ssrefuse-lang: javascript
+    pattern-either:
+      - pattern: execFile("curl", ...)
+      - pattern: spawn("curl", ...)
+      - pattern: exec("curl ..." + ...)
+      - pattern: child_process.$F("curl", ...)

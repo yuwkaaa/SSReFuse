@@ -3,7 +3,7 @@
 PY := .venv/bin/python
 VENV := .venv
 
-.PHONY: help venv validate selftest probe scan report all test clean
+.PHONY: help venv validate selftest probe scan report judge all test clean
 
 help:
 	@echo "make venv      - create .venv and install dependencies"
@@ -12,8 +12,9 @@ help:
 	@echo "make probe     - fire the payload catalog at every lab variant"
 	@echo "make scan      - run the static detectors with their positive control"
 	@echo "make report    - score everything measured so far into results/report.md"
+	@echo "make judge     - run the LLM judge (needs DEEPSEEK_API_KEY in .env)"
 	@echo "make all       - validate, probe, scan, report"
-	@echo "make test      - run the test suite"
+	@echo "make test      - run the test suite (87 tests)"
 
 $(VENV)/bin/python:
 	python3.13 -m venv $(VENV) || python3 -m venv $(VENV)
@@ -35,6 +36,15 @@ scan: venv
 	PYTHONPATH=. $(PY) -m ssrefuse.cli scan
 
 report: venv
+	PYTHONPATH=. $(PY) -m ssrefuse.cli report
+
+# The judge needs a key in .env or in the environment. The ablation holds the
+# model fixed and moves the thinking budget, which is why both runs name the
+# same model; the cache is keyed on the effort too, so neither serves the
+# other's answers and a repeat of either is free.
+judge: venv
+	PYTHONPATH=. $(PY) -m ssrefuse.cli judge --effort off  --rounds 2
+	PYTHONPATH=. $(PY) -m ssrefuse.cli judge --effort high --rounds 2
 	PYTHONPATH=. $(PY) -m ssrefuse.cli report
 
 all: venv

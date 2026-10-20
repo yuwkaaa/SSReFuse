@@ -1,0 +1,39 @@
+# Sink inventory for PHP. The brief names file_get_contents by name; the rest
+# are the other calls that send a request in a PHP codebase, because a rule
+# that only knows the named one reports a smaller attack surface than exists.
+rules:
+  - id: ssrefuse-php-inventory-fetch
+    languages: [php]
+    severity: INFO
+    message: >-
+      Outbound request sink reached here. Whether the destination is
+      attacker-controlled is not decided by this rule.
+    metadata:
+      ssrefuse-detector: inventory
+      ssrefuse-lang: php
+    pattern-either:
+      - pattern: file_get_contents(...)
+      - pattern: readfile(...)
+      - pattern: fopen(...)
+      - pattern: get_headers(...)
+      - pattern: simplexml_load_file(...)
+      - pattern: copy(...)
+      - pattern: fsockopen(...)
+      - pattern: stream_socket_client(...)
+
+  # curl in PHP is two calls: the handle is created with the URL and the
+  # request is sent later. Both are listed because a codebase may set the URL
+  # with curl_setopt instead, and a rule anchored only on curl_init would miss
+  # every one of those.
+  - id: ssrefuse-php-inventory-curl
+    languages: [php]
+    severity: INFO
+    message: >-
+      A curl request is sent here. The destination may have been set at
+      curl_init or by a later curl_setopt.
+    metadata:
+      ssrefuse-detector: inventory
+      ssrefuse-lang: php
+    pattern-either:
+      - pattern: curl_exec(...)
+      - pattern: curl_multi_exec(...)

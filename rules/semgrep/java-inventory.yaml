@@ -1,0 +1,36 @@
+# Sink inventory for Java. The brief names URLConnection; the surrounding
+# calls are listed because openConnection, openStream and the modern client
+# are the same sink reached three ways, and a rule that knows one of them
+# understates the surface.
+rules:
+  - id: ssrefuse-java-inventory-urlconnection
+    languages: [java]
+    severity: INFO
+    message: >-
+      Outbound request sink reached here. Whether the destination is
+      attacker-controlled is not decided by this rule.
+    metadata:
+      ssrefuse-detector: inventory
+      ssrefuse-lang: java
+    pattern-either:
+      - pattern: (URL $U).openConnection(...)
+      - pattern: (URL $U).openStream(...)
+      - pattern: (URI $U).toURL().openStream(...)
+      - pattern: new URL(...).openConnection(...)
+      - pattern: new URL(...).openStream(...)
+
+  - id: ssrefuse-java-inventory-client
+    languages: [java]
+    severity: INFO
+    message: >-
+      Outbound request sink reached here through an HTTP client.
+    metadata:
+      ssrefuse-detector: inventory
+      ssrefuse-lang: java
+    pattern-either:
+      - pattern: (HttpClient $C).send(...)
+      - pattern: (HttpClient $C).sendAsync(...)
+      - pattern: (RestTemplate $R).$M(...)
+      - pattern: (OkHttpClient $C).newCall(...)
+      - pattern: Jsoup.connect(...)
+      - pattern: $CLIENT.execute(new HttpGet(...))

@@ -10,6 +10,7 @@ import itertools
 import json
 import os
 import socket
+import socketserver
 import threading
 import time
 import urllib.parse
@@ -150,9 +151,42 @@ def _internal_admin(path, query, headers):
 
 
 def _metadata(path, query, headers):
-    # Shape mirrors the real IMDSv1 layout so lab code looks realistic; the
-    # contents are fabricated and the address is local to the sandbox.
+    """The link-local metadata address, with the layouts real clouds serve.
+
+    Shapes mirror the published ones so that lab code and payloads look like
+    the ones in the wild; the contents are fabricated and the address is local
+    to the sandbox.
+
+    The important part is that three of these branches require a *request
+    header*. GCP wants `Metadata-Flavor: Google`, Azure wants `Metadata: true`,
+    and IMDSv2 wants a token obtained with a PUT. An SSRF that controls the URL
+    and nothing else cannot produce any of them, so those branches answer
+    without the canary. A run is expected not to see MARKER_METADATA_GUARDED,
+    and the harness records that as a measured negative rather than as silence:
+    "the cloud's own mitigation held" and "the guard held" are different
+    findings and a matrix that cannot tell them apart is not worth reading.
+    """
+    if path.startswith("/computeMetadata"):
+        if headers.get("Metadata-Flavor") != "Google":
+            return 403, {"Content-Type": "text/plain"}, (
+                "Missing Metadata-Flavor:Google header.\n")
+        return 200, {"Content-Type": "text/plain"}, (
+            f"{spec.MARKER_METADATA_GUARDED}\ngcp service account token\n")
+    if path.startswith("/metadata/instance"):
+        if headers.get("Metadata") != "true":
+            return 400, {"Content-Type": "application/json"}, json.dumps(
+                {"error": "Required metadata header not specified"})
+        return 200, {"Content-Type": "application/json"}, json.dumps(
+            {"compute": {"name": spec.MARKER_METADATA_GUARDED}}, indent=2)
+    if path.startswith("/latest/api/token"):
+        # IMDSv2 issues the token only for PUT, which an SSRF that can only
+        # cause a GET cannot send.
+        return 405, {"Content-Type": "text/plain"}, (
+            "IMDSv2 token requests must be PUT\n")
     if "security-credentials" in path:
+        if headers.get("X-aws-ec2-metadata-token"):
+            return 200, {"Content-Type": "text/plain"}, (
+                f"{spec.MARKER_METADATA_GUARDED}\nimdsv2 credentials\n")
         return 200, {"Content-Type": "text/plain"}, json.dumps({
             "Code": "Success",
             "AccessKeyId": "ASIA" + "X" * 16,
@@ -162,6 +196,18 @@ def _metadata(path, query, headers):
     if path.rstrip("/").endswith("/iam"):
         return 200, {"Content-Type": "text/plain"}, "security-credentials/\n"
     return 200, {"Content-Type": "text/plain"}, f"{spec.MARKER_METADATA}\nami-id\nhostname\niam/\n"
+
+
+def _metadata_ecs(path, query, headers):
+    """Task metadata, which needs no header at all -- the reachable one."""
+    return 200, {"Content-Type": "application/json"}, json.dumps(
+        {"TaskARN": "arn:aws:ecs:ssrefuse:fake", "Secret": spec.MARKER_METADATA_ECS},
+        indent=2)
+
+
+def _metadata_alibaba(path, query, headers):
+    return 200, {"Content-Type": "text/plain"}, (
+        f"{spec.MARKER_METADATA_ALIBABA}\nram/security-credentials/\n")
 
 
 def _cgnat(path, query, headers):
@@ -177,6 +223,11 @@ def _public_site(path, query, headers):
     if path == "/redirect":
         target = (query.get("to") or [spec.URL_INTERNAL])[0]
         return 302, {"Location": target, "Content-Type": "text/plain"}, "redirecting\n"
+    if path == "/redirect307":
+        # 307 preserves the method and the body where 302 may not. A guard that
+        # reasons only about the first request cannot tell the two apart.
+        target = (query.get("to") or [spec.URL_INTERNAL])[0]
+        return 307, {"Location": target, "Content-Type": "text/plain"}, "redirecting\n"
     if path == "/chain":
         target = (query.get("to") or [spec.URL_INTERNAL])[0]
         hops = int((query.get("n") or ["3"])[0])
@@ -195,6 +246,53 @@ def _oob(path, query, headers):
     return 200, {"Content-Type": "text/plain"}, f"{spec.MARKER_OOB}\n"
 
 
+# --- the internal service range -------------------------------------------
+# A testbed with a single admin endpoint behind it measures a guard against one
+# thing. The services an SSRF is actually pointed at are a range: an
+# unauthenticated container API, a search cluster, a service-discovery KV
+# store, a framework's own diagnostics endpoint, another host on the corporate
+# network, and two that do not speak HTTP at all. Each serves a canary and
+# nothing else; the shapes below only exist so that lab code and payloads look
+# like the ones they are modelled on.
+
+def _docker_api(path, query, headers):
+    if path.startswith("/version"):
+        return 200, {"Content-Type": "application/json"}, json.dumps(
+            {"Version": "0.0.0-ssrefuse-fake", "ApiVersion": "1.45",
+             "Secret": spec.MARKER_DOCKER}, indent=2)
+    if path.startswith("/containers"):
+        return 200, {"Content-Type": "application/json"}, json.dumps(
+            [{"Id": "ssrefuse-fake", "Image": spec.MARKER_DOCKER}], indent=2)
+    return 200, {"Content-Type": "text/plain"}, f"{spec.MARKER_DOCKER}\n"
+
+
+def _elasticsearch(path, query, headers):
+    if path.rstrip("/") in ("", "/"):
+        return 200, {"Content-Type": "application/json"}, json.dumps(
+            {"cluster_name": spec.MARKER_ELASTIC, "tagline": "You Know, for Canaries"},
+            indent=2)
+    return 200, {"Content-Type": "application/json"}, json.dumps(
+        {"hits": {"total": 1, "hits": [{"_source": {"secret": spec.MARKER_ELASTIC}}]}},
+        indent=2)
+
+
+def _consul(path, query, headers):
+    return 200, {"Content-Type": "application/json"}, json.dumps(
+        [{"Key": "ssrefuse/secret", "Value": spec.MARKER_CONSUL}], indent=2)
+
+
+def _actuator(path, query, headers):
+    return 200, {"Content-Type": "application/json"}, json.dumps(
+        {"propertySources": [{"name": "systemEnvironment",
+                              "properties": {"API_TOKEN": {"value": spec.MARKER_ACTUATOR}}}]},
+        indent=2)
+
+
+def _intranet(path, query, headers):
+    return 200, {"Content-Type": "text/plain"}, (
+        f"{spec.MARKER_RFC1918}\ninternal corporate application\n")
+
+
 HTTP_SERVICES = [
     ("internal-admin", spec.IP_INTERNAL, spec.PORT_INTERNAL_ADMIN, _internal_admin),
     # The same service on IPv6 loopback. Without this listener an [::1] payload
@@ -202,19 +300,79 @@ HTTP_SERVICES = [
     # guard never saw it -- the target simply was not there.
     ("internal-admin6", "::1", spec.PORT_INTERNAL_ADMIN, _internal_admin),
     ("metadata", spec.IP_METADATA, spec.PORT_HTTP, _metadata),
+    ("metadata-ecs", spec.IP_METADATA_ECS, spec.PORT_HTTP, _metadata_ecs),
+    ("metadata-alibaba", spec.IP_METADATA_ALIBABA, spec.PORT_HTTP, _metadata_alibaba),
     ("cgnat", spec.IP_CGNAT, spec.PORT_HTTP, _cgnat),
     ("public-site", spec.IP_PUBLIC, spec.PORT_HTTP, _public_site),
     ("oob-http", spec.IP_OOB, spec.PORT_HTTP, _oob),
+    ("docker-api", spec.IP_INTERNAL, spec.PORT_DOCKER, _docker_api),
+    ("elasticsearch", spec.IP_INTERNAL, spec.PORT_ELASTIC, _elasticsearch),
+    ("consul", spec.IP_INTERNAL, spec.PORT_CONSUL, _consul),
+    ("actuator", spec.IP_INTERNAL, spec.PORT_ACTUATOR, _actuator),
+    ("intranet", spec.IP_RFC1918, spec.PORT_HTTP, _intranet),
+]
+
+# Services that do not speak HTTP. They exist because the question "can this
+# sink reach a line protocol" has a different answer from "can this sink reach
+# an internal HTTP service", and only a sink that can speak gopher:// or
+# dict:// -- in this corpus, the curl subprocess -- can answer it yes. The
+# first bytes the client sends are logged verbatim, because for a blind
+# protocol that is the entire evidence that anything arrived.
+LINE_SERVICES = [
+    ("redis", spec.IP_INTERNAL, spec.PORT_REDIS, spec.MARKER_REDIS, "+%s\r\n"),
+    ("memcached", spec.IP_INTERNAL, spec.PORT_MEMCACHED, spec.MARKER_MEMCACHED, "VERSION %s\r\n"),
 ]
 
 
-def start_all(log: AccessLog) -> list[ThreadingHTTPServer]:
-    """Start DNS plus every HTTP target. Raises if any address cannot be bound."""
-    servers: list[ThreadingHTTPServer] = []
+def _line_server(name: str, address: str, port: int, marker: str, template: str,
+                 log: AccessLog):
+    """A TCP listener that records what was sent to it and answers a banner."""
+
+    class Handler(socketserver.BaseRequestHandler):
+        def handle(self):
+            # Short, because the evidence is the log row rather than the reply:
+            # a client that connects and waits must still produce that row
+            # quickly enough for the probe's own timeout.
+            self.request.settimeout(1.0)
+            received = b""
+            try:
+                while len(received) < 2048:
+                    chunk = self.request.recv(1024)
+                    if not chunk:
+                        break
+                    received += chunk
+                    if b"\n" in chunk:
+                        break
+            except OSError:
+                pass
+            log.record(name, protocol="tcp", port=port,
+                       client=self.client_address[0],
+                       bytes_received=len(received),
+                       first_bytes=received[:200].decode("utf-8", "replace"),
+                       marker=marker)
+            try:
+                self.request.sendall((template % marker).encode())
+            except OSError:
+                pass
+
+    class Server(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    return Server((address, port), Handler)
+
+
+def start_all(log: AccessLog) -> list:
+    """Start DNS plus every target. Raises if any address cannot be bound."""
+    servers: list = []
     for name, addr, port, dispatch in HTTP_SERVICES:
         server_cls = _IPv6Server if ":" in addr else ThreadingHTTPServer
         srv = server_cls((addr, port), _handler(name, log, dispatch))
         srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True, name=name).start()
+        servers.append(srv)
+    for name, addr, port, marker, template in LINE_SERVICES:
+        srv = _line_server(name, addr, port, marker, template, log)
         threading.Thread(target=srv.serve_forever, daemon=True, name=name).start()
         servers.append(srv)
     dns = DNSServer(ZoneResolver(log), port=spec.PORT_DNS,
@@ -241,6 +399,15 @@ def assert_ready(timeout: float = 10.0) -> dict[str, str]:
         ("cgnat", spec.IP_CGNAT, spec.PORT_HTTP, "/", spec.MARKER_CGNAT),
         ("public-site", spec.IP_PUBLIC, spec.PORT_HTTP, "/", spec.MARKER_BENIGN),
         ("oob-http", spec.IP_OOB, spec.PORT_HTTP, "/", spec.MARKER_OOB),
+        ("docker-api", spec.IP_INTERNAL, spec.PORT_DOCKER, "/version", spec.MARKER_DOCKER),
+        ("elasticsearch", spec.IP_INTERNAL, spec.PORT_ELASTIC, "/", spec.MARKER_ELASTIC),
+        ("consul", spec.IP_INTERNAL, spec.PORT_CONSUL, "/v1/kv/?recurse", spec.MARKER_CONSUL),
+        ("actuator", spec.IP_INTERNAL, spec.PORT_ACTUATOR, "/actuator/env", spec.MARKER_ACTUATOR),
+        ("intranet", spec.IP_RFC1918, spec.PORT_HTTP, "/", spec.MARKER_RFC1918),
+        ("metadata-ecs", spec.IP_METADATA_ECS, spec.PORT_HTTP, "/v2/metadata",
+         spec.MARKER_METADATA_ECS),
+        ("metadata-alibaba", spec.IP_METADATA_ALIBABA, spec.PORT_HTTP, "/latest/meta-data/",
+         spec.MARKER_METADATA_ALIBABA),
     ]
     for name, addr, port, path, marker in checks:
         last = "not attempted"
@@ -260,12 +427,52 @@ def assert_ready(timeout: float = 10.0) -> dict[str, str]:
         else:
             raise AssertionError(f"testbed service {name} never became ready ({last})")
 
-    for name in (f"internal.{spec.ZONE}", f"metadata.{spec.ZONE}", f"public.{spec.ZONE}"):
+    # The line-protocol services answer a banner rather than HTTP, so they are
+    # checked by sending nothing and reading what comes back. A service that is
+    # not up here would turn every gopher:// and dict:// probe into a connect
+    # error, which reads as "the guard held".
+    for name, addr, port, marker, _template in LINE_SERVICES:
+        last = "not attempted"
+        while time.time() < deadline:
+            try:
+                with socket.create_connection((addr, port), timeout=2) as sock:
+                    sock.settimeout(3)
+                    # Send a line first. Neither of the services these imitate
+                    # greets a client unprompted, and the handler answers once
+                    # it has seen a line, so a readiness check that only reads
+                    # would be measuring its own timeout.
+                    sock.sendall(b"PING\r\n")
+                    banner = sock.recv(256).decode("utf-8", "replace")
+                if marker not in banner:
+                    raise AssertionError(f"{name}: banner was {banner[:60]!r}")
+                evidence[name] = f"{addr}:{port} -> banner carries marker"
+                break
+            except Exception as exc:  # noqa: BLE001 - reported verbatim below
+                last = f"{type(exc).__name__}: {exc}"
+                time.sleep(0.1)
+        else:
+            raise AssertionError(f"testbed service {name} never became ready ({last})")
+
+    # The closed port is a control in the other direction: a probe that reaches
+    # it must fail, or "connected" means nothing anywhere else in the run.
+    try:
+        socket.create_connection((spec.IP_INTERNAL, spec.PORT_CLOSED), timeout=1).close()
+        raise AssertionError(
+            f"port {spec.PORT_CLOSED} was supposed to be closed but something answered; "
+            f"refusing to measure")
+    except OSError:
+        evidence["closed-port-control"] = (
+            f"{spec.IP_INTERNAL}:{spec.PORT_CLOSED} refuses connections, as required")
+
+    for name in (f"internal.{spec.ZONE}", f"metadata.{spec.ZONE}", f"public.{spec.ZONE}",
+                 f"intranet.{spec.ZONE}", f"docker.{spec.ZONE}"):
         evidence[f"dns:{name}"] = socket.gethostbyname(name)
     expected = {
         f"internal.{spec.ZONE}": spec.IP_INTERNAL,
         f"metadata.{spec.ZONE}": spec.IP_METADATA,
         f"public.{spec.ZONE}": spec.IP_PUBLIC,
+        f"intranet.{spec.ZONE}": spec.IP_RFC1918,
+        f"docker.{spec.ZONE}": spec.IP_INTERNAL,
     }
     for name, want in expected.items():
         got = evidence[f"dns:{name}"]

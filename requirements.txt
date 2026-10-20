@@ -1,0 +1,28 @@
+# Direct dependencies, matching the ranges declared in pyproject.toml.
+#
+#   pip install -r requirements.txt
+#
+# This file is the convenient path. The reproducible one is
+# requirements-lock.txt, which pins every transitive version to the set the
+# published numbers were measured on; use that one on a machine whose results
+# are meant to be comparable with the ones in results/report.md.
+#
+# Outside Python, the testbed needs: unshare, ip and mount (util-linux and
+# iproute2) for the sandbox, curl for the subprocess sink, and node >= 18 for
+# the JavaScript lab. None of them are installed by pip. `ssrefuse probe`
+# refuses to start a lab whose interpreter is missing rather than reporting a
+# run with that lab silently absent.
+
+# --- runtime -------------------------------------------------------------
+pyyaml>=6.0
+requests>=2.31
+jinja2>=3.1
+dnslib>=0.9
+flask>=3.0
+httpx>=0.27
+
+# --- static analysis tier ------------------------------------------------
+semgrep>=1.80
+
+# --- tests ---------------------------------------------------------------
+pytest>=8.0
