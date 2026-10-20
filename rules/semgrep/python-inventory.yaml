@@ -1,0 +1,55 @@
+# Sink inventory for Python. No reasoning about where the URL came from: this is
+# the recall-oriented candidate generator the fused pipeline starts from, and the
+# baseline its precision is measured against.
+rules:
+  - id: ssrefuse-py-inventory-http-sink
+    languages: [python]
+    severity: INFO
+    message: >-
+      Outbound request sink reached here. Whether the destination is
+      attacker-controlled is not decided by this rule.
+    metadata:
+      ssrefuse-detector: inventory
+      ssrefuse-lang: python
+    patterns:
+      - pattern-either:
+          - pattern: requests.$M(...)
+          - pattern: httpx.$M(...)
+          - pattern: aiohttp.ClientSession(...).$M(...)
+      - metavariable-regex:
+          metavariable: $M
+          regex: ^(get|post|put|patch|delete|head|options|request|send)$
+
+  # Sinks whose name is fixed are kept in a rule of their own. Measured: a
+  # metavariable-regex sitting beside a pattern-either discards the alternatives
+  # that never bind that metavariable, so folding these in with the clients above
+  # silently dropped every urlopen sink in the corpus.
+  - id: ssrefuse-py-inventory-fixed-sink
+    languages: [python]
+    severity: INFO
+    message: >-
+      Outbound request sink with a fixed name reached here.
+    metadata:
+      ssrefuse-detector: inventory
+      ssrefuse-lang: python
+    pattern-either:
+      - pattern: urllib.request.urlopen(...)
+      - pattern: urlopen(...)
+      - pattern: http.client.HTTPConnection(...)
+      - pattern: socket.create_connection(...)
+
+  - id: ssrefuse-py-inventory-subprocess-fetch
+    languages: [python]
+    severity: INFO
+    message: >-
+      A fetch delegated to an external binary. Library-level rules cannot see
+      this sink at all.
+    metadata:
+      ssrefuse-detector: inventory
+      ssrefuse-lang: python
+    patterns:
+      - pattern-either:
+          - pattern: subprocess.run([..., "curl", ...], ...)
+          - pattern: subprocess.$F([..., "curl", ...], ...)
+          - pattern: subprocess.$F("curl ..." + ..., ...)
+          - pattern: os.system("curl ..." + ...)

@@ -1,0 +1,51 @@
+# The same taint rule with the validation shapes a reviewer would reach for
+# declared as sanitizers: compare the parsed hostname, or classify the resolved
+# address. Both are necessary and neither is sufficient, so this configuration is
+# expected to lose the variants whose guard has the right shape and the wrong
+# effect. It is included to measure that loss rather than to assert it.
+rules:
+  - id: ssrefuse-py-taint-naive
+    mode: taint
+    languages: [python]
+    severity: WARNING
+    message: >-
+      A request-controlled value reaches an outbound request sink without passing
+      any hostname or address validation this configuration recognises.
+    metadata:
+      ssrefuse-detector: taint-naive
+      ssrefuse-lang: python
+    pattern-sources:
+      - pattern: request.args.get(...)
+      - pattern: request.args[...]
+      - pattern: request.form.get(...)
+      - pattern: request.values.get(...)
+      - pattern: request.get_json(...)
+      - pattern: request.json
+      - pattern: request.headers.get(...)
+      - pattern: request.cookies.get(...)
+      - pattern: request.data
+    pattern-sanitizers:
+      - pattern: urllib.parse.urlparse(...).hostname
+      - pattern: urlparse(...).hostname
+      - pattern: ipaddress.ip_address(...)
+      - pattern: socket.gethostbyname(...)
+    pattern-sinks:
+      # Clients addressed by method name. The method-name constraint lives in a
+      # block of its own: placed beside a pattern-either it would discard the
+      # alternatives that do not bind $M.
+      - patterns:
+          - pattern-either:
+              - pattern: requests.$M($URL, ...)
+              - pattern: httpx.$M($URL, ...)
+          - focus-metavariable: $URL
+          - metavariable-regex:
+              metavariable: $M
+              regex: ^(get|post|put|patch|delete|head|options|request)$
+      - patterns:
+          - pattern-either:
+              - pattern: urllib.request.urlopen($URL, ...)
+              - pattern: urlopen($URL, ...)
+          - focus-metavariable: $URL
+      - patterns:
+          - pattern: subprocess.$F([..., $URL], ...)
+          - focus-metavariable: $URL

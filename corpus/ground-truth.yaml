@@ -1,0 +1,332 @@
+# SSReFuse ground truth.
+#
+# label semantics
+#   vulnerable : at least one attacker-supplied input makes the application send
+#                a request to an internal target (the admin service, the fake
+#                metadata address, the CGNAT service) or read a local file.
+#   safe       : no such input exists. These rows are the false-positive control
+#                set, so each one needs a reason recorded in `why_safe`.
+#
+# The labels here are a claim about the application. The claim that a *specific
+# bypass family* works is never written here: the harness measures that and the
+# evaluator compares its measurement against `bypasses_declared`. A mismatch is
+# a defect in the lab or in the catalog, and the report prints it either way.
+#
+# A variant whose sink lives in a helper declares `uses_shared`, naming a region
+# marked the same way in the source. A finding inside a shared region is
+# attributed to every variant that declares it, and the report says how many
+# findings were attributed that way, so the indirection is visible rather than
+# buried in a detection count.
+#
+# Line ranges are not stored. The loader reads them from the @ssrefuse:begin/end
+# markers in the source so that editing a lab cannot silently invalidate them.
+
+meta:
+  version: 1
+  guards:
+    G0_none: no validation at all
+    G1_denylist_substring: blocked strings searched in the raw URL text
+    G2_denylist_host: parsed hostname compared against a blocklist
+    G3_allowlist_prefix: URL must start with an allowlisted origin string
+    G4_allowlist_substring: allowlisted host must appear somewhere in the URL
+    G5_allowlist_host_redirects: exact hostname allowlist, client follows redirects
+    G6_allowlist_host_noredirect: exact hostname allowlist, redirects refused
+    G7_resolve_check_public: resolve, reject non-global address, then fetch by name
+    G8_resolve_pin_connect: resolve, reject non-global address, connect to that address
+    G9_scheme_only: scheme restricted to http/https, nothing else checked
+    G10_regex_unanchored: allowlist expressed as a pattern that is not anchored at the end
+    G11_guard_wrong_value: a correct check applied to a value other than the one fetched
+    G12_path_concat_unvalidated: URL assembled from a fixed host and an unvalidated path
+  flows:
+    F0_direct: source and sink in the same function
+    F1_interprocedural: taint passes through a helper function
+    F2_container: taint read out of a dict or JSON structure
+    F3_assembled: URL built by interpolation, only a component is tainted
+    F4_stored: taint persisted by one request and fetched by another
+
+apps:
+  flask_ssrf:
+    lang: python
+    file: corpus/labs/flask_ssrf/app.py
+    start: ["python", "corpus/labs/flask_ssrf/app.py", "{port}"]
+    ready_marker: LAB-READY
+    framework: flask
+
+variants:
+  - id: py-001
+    app: flask_ssrf
+    sink: requests.get
+    guards: [G0_none]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/direct, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B01_plain_loopback, B07_dns_to_internal, B15_metadata_service, B16_cgnat_range]
+
+  - id: py-002
+    app: flask_ssrf
+    sink: requests.get
+    guards: [G0_none]
+    flow: F0_direct
+    observability: blind
+    label: vulnerable
+    entry: {method: GET, path: /preview/blind, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B01_plain_loopback]
+    notes: >
+      The response body is discarded, so only the access log and the DNS log can
+      confirm a hit. B18 is not declared here because it is an instrument rather
+      than a bypass; the evaluator tracks it as blind-fetch confirmation.
+
+  - id: py-003
+    app: flask_ssrf
+    sink: requests.get
+    guards: [G0_none]
+    flow: F1_interprocedural
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/helper, inject: query, param: url, payload_kind: url}
+    uses_shared: [shared.fetch_remote]
+    bypasses_declared: [B01_plain_loopback]
+
+  - id: py-004
+    app: flask_ssrf
+    sink: requests.get
+    guards: [G0_none]
+    flow: F2_container
+    observability: reflected
+    label: vulnerable
+    entry: {method: POST, path: /preview/json, inject: json, json_path: source.href, payload_kind: url}
+    uses_shared: [shared.fetch_remote]
+    bypasses_declared: [B01_plain_loopback]
+
+  - id: py-005
+    app: flask_ssrf
+    sink: requests.get
+    guards: [G12_path_concat_unvalidated]
+    flow: F3_assembled
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/assembled, inject: query, param: host, payload_kind: host}
+    bypasses_declared: [B01_plain_loopback, B07_dns_to_internal, B10_subdomain_suffix]
+
+  - id: py-006
+    app: flask_ssrf
+    sink: requests.get
+    guards: [G1_denylist_substring]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/denylist-string, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B02_loopback_alias, B03_decimal_ip, B04_octal_ip, B05_hex_ip,
+                        B06_ipv6_loopback, B07_dns_to_internal, B16_cgnat_range]
+
+  - id: py-007
+    app: flask_ssrf
+    sink: requests.get
+    guards: [G2_denylist_host]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/denylist-host, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B02_loopback_alias, B03_decimal_ip, B04_octal_ip, B05_hex_ip,
+                        B06_ipv6_loopback, B07_dns_to_internal, B08_trailing_dot, B16_cgnat_range]
+
+  - id: py-008
+    app: flask_ssrf
+    sink: requests.get
+    guards: [G3_allowlist_prefix]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/allow-prefix, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B09_userinfo_confusion, B10_subdomain_suffix]
+
+  - id: py-009
+    app: flask_ssrf
+    sink: requests.get
+    guards: [G4_allowlist_substring]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/allow-substring, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B09_userinfo_confusion, B10_subdomain_suffix, B11_query_confusion,
+                        B12_fragment_confusion]
+
+  - id: py-010
+    app: flask_ssrf
+    sink: requests.get
+    guards: [G10_regex_unanchored]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/allow-regex, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B09_userinfo_confusion, B10_subdomain_suffix]
+
+  - id: py-011
+    app: flask_ssrf
+    sink: requests.get
+    guards: [G5_allowlist_host_redirects]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/allow-host-redirects, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B13_redirect]
+
+  - id: py-012
+    app: flask_ssrf
+    sink: requests.get
+    guards: [G6_allowlist_host_noredirect, G9_scheme_only]
+    flow: F0_direct
+    observability: reflected
+    label: safe
+    why_safe: >
+      The hostname is compared for equality after parsing and redirects are
+      refused, so the only reachable host is the allowlisted partner. Reaching
+      an internal target would require that name to resolve internally, which
+      the testbed zone does not do.
+    entry: {method: GET, path: /preview/allow-host-noredirect, inject: query, param: url, payload_kind: url}
+    bypasses_declared: []
+
+  - id: py-013
+    app: flask_ssrf
+    sink: requests.get
+    guards: [G7_resolve_check_public, G9_scheme_only]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/resolve-check, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B14_dns_rebinding]
+    notes: the address that is validated and the address that is connected to come from two lookups
+
+  - id: py-014
+    app: flask_ssrf
+    sink: requests.get
+    guards: [G8_resolve_pin_connect, G9_scheme_only]
+    flow: F0_direct
+    observability: reflected
+    label: safe
+    why_safe: >
+      One lookup decides both the check and the connection: the validated
+      address is the address in the URL that is fetched, the hostname travels in
+      the Host header, and redirects are refused. There is no second lookup to
+      win and no redirect to follow. The route still fetches arbitrary *public*
+      URLs, which is the feature working as intended; the label is about
+      internal reach, so the out-of-band canary being reachable from here is
+      expected and is not counted as a bypass.
+    entry: {method: GET, path: /preview/resolve-pin, inject: query, param: url, payload_kind: url}
+    bypasses_declared: []
+
+  - id: py-015
+    app: flask_ssrf
+    sink: requests.get
+    guards: [G9_scheme_only]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/scheme-only, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B01_plain_loopback, B15_metadata_service]
+
+  - id: py-016
+    app: flask_ssrf
+    sink: urllib.request.urlopen
+    guards: [G0_none]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/urlopen, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B01_plain_loopback, B17_file_scheme]
+    notes: only sink in the lab that accepts non-HTTP handlers
+
+  - id: py-017
+    app: flask_ssrf
+    sink: httpx.get
+    guards: [G2_denylist_host]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/httpx, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B03_decimal_ip, B07_dns_to_internal]
+    notes: same guard as py-007 behind a different client library
+
+  - id: py-018
+    app: flask_ssrf
+    sink: subprocess.run+curl
+    guards: [G0_none]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/curl, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B01_plain_loopback]
+    notes: the fetch leaves the process entirely, so library-level rules see nothing
+
+  - id: py-019
+    app: flask_ssrf
+    sink: none
+    guards: []
+    flow: F4_stored
+    observability: reflected
+    label: safe
+    why_safe: >
+      This route only writes the URL into module state. No request-sending call
+      is reachable from it, so a finding anchored here is a false positive even
+      though the value it stores is later fetched by py-020.
+    entry: {method: POST, path: /preview/enqueue, inject: json, json_path: url, payload_kind: url}
+    bypasses_declared: []
+    no_sink: true
+
+  - id: py-020
+    app: flask_ssrf
+    sink: requests.get
+    guards: [G0_none]
+    flow: F4_stored
+    observability: reflected
+    label: vulnerable
+    entry:
+      steps:
+        - {method: POST, path: /preview/enqueue, inject: json, json_path: url, payload_kind: url,
+           capture: {job_id: job_id}}
+        - {method: GET, path: "/preview/run/{job_id}"}
+    bypasses_declared: [B01_plain_loopback]
+    notes: second-order flow; nothing tainted appears inside the sink function
+
+  - id: py-021
+    app: flask_ssrf
+    sink: requests.get
+    guards: [G11_guard_wrong_value]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/checked-wrong-value, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B21_decoded_delimiter]
+    notes: >
+      The check parses a decoded copy and the fetch uses the raw value. Any
+      payload whose escaped form has the allowlisted hostname but whose raw form
+      does not resolve there gets through.
+
+  - id: py-022
+    app: flask_ssrf
+    sink: requests.get
+    guards: []
+    flow: F0_direct
+    observability: reflected
+    label: safe
+    why_safe: >
+      The URL is a module constant. No request parameter, header or body field
+      reaches this call, so there is no attacker-controlled input at all.
+    entry: {method: GET, path: /status/upstream, inject: none, payload_kind: none}
+    bypasses_declared: []
+    no_user_input: true
+
+  - id: py-023
+    app: flask_ssrf
+    sink: requests.get
+    guards: [G12_path_concat_unvalidated]
+    flow: F3_assembled
+    observability: reflected
+    label: safe
+    why_safe: >
+      Only the path is attacker-controlled and the validation rejects every
+      character that could end the path component and take over the authority,
+      which the B09 and B20 path payloads exercise directly.
+    entry: {method: GET, path: /preview/path-only, inject: query, param: path, payload_kind: path}
+    bypasses_declared: []
