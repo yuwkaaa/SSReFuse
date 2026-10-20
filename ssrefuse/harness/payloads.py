@@ -90,6 +90,7 @@ EXPECT_MARKERS = {
     "redis": spec.MARKER_REDIS,
     "memcached": spec.MARKER_MEMCACHED,
     "localfile": spec.MARKER_LOCALFILE,
+    "self_admin": spec.MARKER_SELF_ADMIN,
     "benign": spec.MARKER_BENIGN,
     "oob": spec.MARKER_OOB,
 }
@@ -505,8 +506,13 @@ FAMILIES: tuple[Family, ...] = (
         note="A denylist written for the loopback address says nothing about "
              "which port behind it answers. This family is the reason the "
              "testbed runs a service range rather than one admin endpoint: the "
-             "Docker API alone turns a read primitive into code execution, and "
-             "no guard in this corpus distinguishes port 2375 from port 19001.",
+             "Docker API alone turns a read primitive into code execution. "
+             "Exactly one guard in the corpus stops it, G17_port_allowlist, and "
+             "it had to be written for the purpose -- every guard phrased "
+             "against an address or a name lets the whole range through. The "
+             "earlier version of this note said no guard distinguished port "
+             "2375 from port 19001, which was true of the corpus and not of "
+             "guards in general, and overstated the family by that difference.",
     ),
     Family(
         id="B25_rfc1918_host",
@@ -641,6 +647,46 @@ FAMILIES: tuple[Family, ...] = (
         defeats=("G7_resolve_check_public",),
         note="Two lookups, TTL 0, alternating answers: the validated address and "
              "the connected address are never the same one.",
+    ),
+
+    Family(
+        id="B34_discovery_document_pivot",
+        title="a trusted document chooses the destination of the next fetch",
+        axis="flow",
+        url_values=tuple(
+            (f"http://{spec.ALLOWED_HOST}/pivot/"
+             + "".join(f"%{b:02X}" for b in target.encode()), key)
+            for target, key in (
+                (f"http://{spec.IP_INTERNAL}:{ADMIN}", "internal"),
+                (f"http://{spec.IP_INTERNAL}:{spec.PORT_DOCKER}/version", "docker"),
+                (f"http://{spec.IP_METADATA}/{METADATA_PATH}", "metadata"),
+            )),
+        defeats=("G6_allowlist_host_noredirect", "G5_allowlist_host_redirects"),
+        note="Not a redirect: the first response is a 200 whose *body* names the "
+             "next URL. An allowlist on the issuer constrains the first fetch "
+             "and says nothing about the second, because by the time the "
+             "second URL exists it is not user input any more. This is the "
+             "shape of every discovery-document feature -- OIDC, SAML, "
+             "oEmbed, Open Graph -- and a guard that only validates what the "
+             "user typed cannot see it.",
+    ),
+    Family(
+        id="B35_self_admin",
+        title="the application's own privileged route, reached from itself",
+        axis="target",
+        url_values=tuple(
+            (f"http://127.0.0.1:{port}/internal/admin", "self_admin")
+            for port in sorted(set(spec.LAB_PORTS.values()))),
+        host_values=tuple(
+            (f"127.0.0.1:{port}", "self_admin")
+            for port in sorted(set(spec.LAB_PORTS.values()))),
+        defeats=("G0_none", "G9_scheme_only"),
+        note="The target is the application itself. Its admin route trusts the "
+             "address a request arrives from, which is not a credential: any "
+             "feature that makes the process send a request makes that socket "
+             "a loopback one. Each lab only answers on its own port, so the "
+             "other value in this family is a connection error by "
+             "construction and the cell takes the stronger of the two.",
     ),
 
     # ---- blind-only oracle ------------------------------------------------

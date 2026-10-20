@@ -44,11 +44,21 @@ const ALLOWED_HOST = 'public.ssrefuse.test';
 const ALLOWED_ORIGIN = 'http://public.ssrefuse.test';
 const BLOCKED_SUBSTRINGS = ['127.0.0.1', 'localhost', '169.254.169.254'];
 const BLOCKED_HOSTS = new Set(['127.0.0.1', 'localhost', '169.254.169.254', '0.0.0.0']);
+const ALLOWED_PORTS = new Set([80, 443]);
 const TIMEOUT_MS = 4000;
 
 // Pending preview jobs, written by one route and consumed by another. The
 // second read is what makes the stored variant a second-order flow.
 const PREVIEW_QUEUE = new Map();
+
+// Webhooks registered by one request and delivered by another.
+const WEBHOOKS = new Map();
+
+// The addresses this application treats as privileged, and the secret that
+// protects. Both are ordinary application code: the point of the variant is
+// that no SSRF guard anywhere else in this file knows they exist.
+const TRUSTED_CLIENTS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+const SELF_ADMIN_SECRET = 'SSREFUSE-APP-SELF-ADMIN-SECRET';
 
 // Address ranges that are not reachable from the public internet, written out
 // because Node has no equivalent of Python's ipaddress module. The list matches
@@ -157,6 +167,7 @@ function createApp() {
         query,
         params: found.params,
         headers: request.headers,
+        socket: request.socket,
         body: request.method === 'POST' ? await readBody(request) : {},
       };
       try {
@@ -168,7 +179,10 @@ function createApp() {
         res.status(500).json({ ok: false, error: `${error.name}: ${error.message}` });
       }
     });
-    server.listen(port, '127.0.0.1', () => onReady(server));
+    // Bound on every address inside the namespace, not only loopback: a route
+    // that trusts loopback can only be measured if the probe can arrive from
+    // somewhere else. Safe here because the namespace has no route out.
+    server.listen(port, '0.0.0.0', () => onReady(server));
   }
 
   return app;
@@ -530,6 +544,35 @@ app.get('/preview/scheme-only', async (req, res) => {
 });
 // @ssrefuse:end js-016
 
+// @ssrefuse:begin js-024
+app.get('/preview/port-allowlist', async (req, res) => {
+  // Allows only the ports a web service answers on. This is the guard the
+  // rest of the corpus was missing, and the only one here that reasons about
+  // the port at all: it stops the pivot the service-range family relies on,
+  // because the container API, the search cluster and the key-value stores
+  // each sit on a port of their own and none of them is 80. It is still a
+  // guard on one request, so anything answering on an allowed port stays
+  // reachable and anything that moves the fetch after the check is unaffected.
+  const url = req.query.url || '';
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return blocked(res, 'unparsable url');
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return blocked(res, 'scheme not allowed');
+  }
+  const port = Number(parsed.port || (parsed.protocol === 'https:' ? 443 : 80));
+  if (!ALLOWED_PORTS.has(port)) {
+    return blocked(res, `port ${port} not allowed`);
+  }
+  const response = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+  const result = { status: response.status, text: await response.text() };
+  return ok(res, result.text, { status: result.status, checked_port: port });
+});
+// @ssrefuse:end js-024
+
 // ---------------------------------------------------------------------------
 // Sink diversity
 // ---------------------------------------------------------------------------
@@ -653,6 +696,100 @@ app.get('/preview/path-only', async (req, res) => {
   return ok(res, result.text, { status: result.status });
 });
 // @ssrefuse:end js-023
+
+// ---------------------------------------------------------------------------
+// Entry points: the feature that makes the application fetch a URL.
+//
+// Everything above varies the guard and holds the entry point fixed. Real
+// reports name a feature instead: a webhook, an identity provider's discovery
+// document, an avatar import. The feature decides which guards are even
+// possible, so here it is the variable and the guard is held at the weakest
+// setting that still makes the route realistic.
+// ---------------------------------------------------------------------------
+
+// @ssrefuse:begin js-025
+app.post('/webhooks', async (req, res) => {
+  // Registers a webhook, validating the host at registration time. The guard
+  // is correct for the request it runs in; what it cannot constrain is the
+  // request that happens later, against whatever the name resolves to then.
+  const url = (req.body || {}).url || '';
+  let host;
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    return blocked(res, 'unparsable url');
+  }
+  if (host !== ALLOWED_HOST) {
+    return blocked(res, 'host not allowlisted at registration');
+  }
+  const hookId = String(WEBHOOKS.size + 1);
+  WEBHOOKS.set(hookId, url);
+  return res.status(200).json({ ok: true, hook_id: hookId, registered: url });
+});
+// @ssrefuse:end js-025
+
+// @ssrefuse:begin js-026
+app.post('/webhooks/:hookId/deliver', async (req, res) => {
+  // Delivers to a registered webhook. No check runs here, and that is the
+  // shape of the bug rather than an omission: the value was validated once,
+  // by a different request, against an answer that is not binding on this
+  // one. Redirects are followed because a webhook that refused them would
+  // break against ordinary endpoints.
+  const url = WEBHOOKS.get(req.params.hookId);
+  if (url === undefined) {
+    return res.status(404).json({ ok: false, error: 'no such webhook' });
+  }
+  const response = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+  const result = { status: response.status, text: await response.text() };
+  return ok(res, result.text, { status: result.status, delivered_to: url });
+});
+// @ssrefuse:end js-026
+
+// @ssrefuse:begin js-027
+app.post('/sso/configure', async (req, res) => {
+  // Fetches an identity provider's discovery document, then its keys. The
+  // issuer is allowlisted and the first fetch is constrained by that. The
+  // second is not: jwks_uri comes out of the document, so whoever answers the
+  // first request chooses the destination of the second. A guard on user
+  // input never sees it, because by then the value is not user input.
+  const issuer = (req.body || {}).issuer || '';
+  let host;
+  try {
+    host = new URL(issuer).hostname.toLowerCase();
+  } catch {
+    return blocked(res, 'unparsable issuer');
+  }
+  if (host !== ALLOWED_HOST) {
+    return blocked(res, 'issuer not allowlisted');
+  }
+  const discovery = await fetch(`${issuer.replace(/\/$/, '')}/.well-known/openid-configuration`,
+    { signal: AbortSignal.timeout(TIMEOUT_MS) });
+  let jwksUri;
+  try {
+    jwksUri = (await discovery.json()).jwks_uri || '';
+  } catch {
+    return blocked(res, 'discovery document is not JSON');
+  }
+  const keys = await fetch(jwksUri, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+  const text = await keys.text();
+  return ok(res, text, { status: keys.status, jwks_uri: jwksUri });
+});
+// @ssrefuse:end js-027
+
+// @ssrefuse:begin js-028
+app.get('/internal/admin', async (req, res) => {
+  // Privileged, and the only thing guarding it is where the request came
+  // from. The address a request arrives from is not a credential: it says
+  // which socket the kernel accepted, and any feature that makes this process
+  // send a request makes that socket a loopback one. Nothing here is broken
+  // in isolation; it becomes reachable because js-001 exists.
+  const caller = req.socket.remoteAddress || '';
+  if (!TRUSTED_CLIENTS.has(caller)) {
+    return blocked(res, `admin is local-only, you are ${caller}`);
+  }
+  return res.status(200).json({ ok: true, secret: SELF_ADMIN_SECRET, caller });
+});
+// @ssrefuse:end js-028
 
 app.get('/', async (req, res) => {
   const routes = app.routes.map((route) => `${route.method} ${route.pattern}`).sort();

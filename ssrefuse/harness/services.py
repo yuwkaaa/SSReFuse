@@ -223,6 +223,32 @@ def _public_site(path, query, headers):
     if path == "/redirect":
         target = (query.get("to") or [spec.URL_INTERNAL])[0]
         return 302, {"Location": target, "Content-Type": "text/plain"}, "redirecting\n"
+    if path.endswith("/.well-known/openid-configuration"):
+        prefix = path[: -len("/.well-known/openid-configuration")]
+        if prefix.startswith("/pivot/"):
+            # The destination of the *second* fetch, carried in the path so
+            # that an application which builds the discovery URL by plain
+            # concatenation preserves it. This is the attacker's control over
+            # a hop that no guard on user input ever sees.
+            target = urllib.parse.unquote(prefix[len("/pivot/"):])
+            return 200, {"Content-Type": "application/json"}, json.dumps(
+                {"issuer": f"http://{spec.ALLOWED_HOST}", "jwks_uri": target}, indent=2)
+    if path == "/.well-known/openid-configuration":
+        # A discovery document, which is how an identity provider tells a
+        # relying party where to fetch the signing keys. The second URL is
+        # chosen by whoever serves this document, not by the application that
+        # validated the first one -- so an allowlist on the issuer says
+        # nothing about where the key fetch ends up. The query parameter is
+        # the attacker's control over that second hop.
+        jwks = (query.get("jwks") or [f"http://{spec.ALLOWED_HOST}/keys"])[0]
+        return 200, {"Content-Type": "application/json"}, json.dumps({
+            "issuer": f"http://{spec.ALLOWED_HOST}",
+            "jwks_uri": jwks,
+            "authorization_endpoint": f"http://{spec.ALLOWED_HOST}/authorize",
+        }, indent=2)
+    if path == "/keys":
+        return 200, {"Content-Type": "application/json"}, json.dumps(
+            {"keys": [{"kid": "benign", "kty": "oct", "k": spec.MARKER_BENIGN}]})
     if path == "/redirect307":
         # 307 preserves the method and the body where 302 may not. A guard that
         # reasons only about the first request cannot tell the two apart.

@@ -286,8 +286,37 @@ def ablation_table(arms, corpus, runs, dyn) -> str:
     if not rows:
         return "Only mock runs on disk, so there is nothing to compare."
 
-    lines = ["**What each arm decided.** Scored against the declared labels, over the",
-             "candidate set the inventory tier proposed.", "",
+    def _at(file: str, line: int) -> tuple[str, int]:
+        """Normalise both sides the same way, or nothing ever matches.
+
+        The two sides of this comparison are written by different code paths
+        and one of them used to be normalised and the other not, which made
+        every arm look stale. Both go through here now.
+        """
+        return (str(file).replace(str(REPO_ROOT) + "/", ""), line)
+
+    lines = []
+    current = {_at(c.file, c.line) for c in (runs.get("inventory").candidates
+                                             if runs.get("inventory") else [])}
+    if current:
+        for name, payload, judgements in arms:
+            if payload.get("client", {}).get("is_mock"):
+                continue
+            judged_at = {_at(j.file, j.line) for j in judgements}
+            missing = current - judged_at
+            gone = judged_at - current
+            if missing or gone:
+                lines += [
+                    f"**The `{payload.get('reasoning_effort', '?')}` arm is stale.** The "
+                    f"corpus has changed since it ran: {len(missing)} candidate "
+                    f"location(s) it never saw, {len(gone)} it judged that no longer "
+                    f"exist. Re-run `ssrefuse judge` before using these rows. They are "
+                    f"printed rather than hidden because a missing table invites a "
+                    f"guess, and a stale one that says so does not.", ""]
+                break
+
+    lines += ["**What each arm decided.** Scored against the declared labels, over the",
+              "candidate set the inventory tier proposed.", "",
              "| thinking | locations | vulnerable | safe | needs_dynamic_test | "
              "2nd round | unparsable |", "|---|---|---|---|---|---|---|"]
     for r in rows:

@@ -218,8 +218,16 @@ class LogWindow:
 
 
 def _request(port: int, method: str, path: str, body: dict | None = None,
-             timeout: float = 15.0) -> tuple[int, str]:
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+             timeout: float = 15.0, via: str = "127.0.0.1") -> tuple[int, str]:
+    """Send one request to a lab.
+
+    ``via`` is the address the lab is reached on, and it defaults to loopback
+    because that is where the labs listen. A variant whose guard trusts
+    loopback has to declare a different one: otherwise the probe's own
+    request already satisfies the guard, and the variant measures the
+    harness rather than the application.
+    """
+    conn = http.client.HTTPConnection(via, port, timeout=timeout)
     try:
         payload = json.dumps(body).encode() if body is not None else None
         headers = {"Content-Type": "application/json"} if payload else {}
@@ -346,7 +354,8 @@ class Prober:
         try:
             for step in _build_steps(variant, payload.value):
                 method, path, json_body = _render_step(step, step.get("value"), captured)
-                status, body = _request(port, method, path, json_body)
+                status, body = _request(port, method, path, json_body,
+                                        via=step.get("via", "127.0.0.1"))
                 if step.get("capture"):
                     try:
                         parsed = json.loads(body)
@@ -405,6 +414,7 @@ class Prober:
         app = self.corpus.apps[app_name]
         lab = LabProcess(app, port, self.log_dir, python=python)
         identity = lab.start()
+        control = self._self_admin_control(port)
         try:
             outcomes: list[Outcome] = []
             for variant in self.corpus.for_app(app_name):
@@ -412,4 +422,26 @@ class Prober:
         finally:
             lab.stop()
         return {"app": app_name, "lab": identity,
+                "self_admin_control": control,
                 "outcomes": [o.as_dict() for o in outcomes]}
+
+    def _self_admin_control(self, port: int) -> dict:
+        """The privileged route, reached the way an attacker reaches it.
+
+        One half of a pair. This half must be refused: the request arrives
+        from an address that is not loopback, which is what the route checks.
+        The other half is the B35 family fired at a route with no guard,
+        where the application fetches the same URL itself and the check
+        passes. Without this half, a green B35 cell could mean the route was
+        never protected at all, and the variant would be measuring nothing.
+        """
+        try:
+            status, body = _request(port, "GET", "/internal/admin", timeout=5,
+                                    via=spec.LAB_EXTERNAL_ADDRESS)
+        except Exception as exc:  # noqa: BLE001 - reported verbatim
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                    "via": spec.LAB_EXTERNAL_ADDRESS}
+        leaked = spec.MARKER_SELF_ADMIN in body
+        return {"ok": status == 403 and not leaked, "status": status,
+                "via": spec.LAB_EXTERNAL_ADDRESS, "secret_leaked": leaked,
+                "body_head": body[:140].replace("\n", " ")}

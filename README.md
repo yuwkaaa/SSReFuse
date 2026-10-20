@@ -273,6 +273,32 @@ reached is then the client's decision, not the guard's. And `gopher://` -- the t
 an SSRF into writes against Redis -- works only through the subprocess sink, which is the one sink a
 library-level static rule cannot see at all.
 
+### What a port allowlist actually buys
+
+`G17_port_allowlist` is the only guard in the corpus that reasons about the port, and it exists
+because the report previously said something stronger than it had earned. Each lab has a control
+beside it -- `py-015` and `js-016`, the same sink and the same scheme check without the port check
+-- so the difference between the two rows is the port allowlist and nothing else.
+
+| | Python (`py-024` vs `py-015`) | JavaScript (`js-024` vs `js-016`) |
+|---|---|---|
+| families defeating the control | 24 | 22 |
+| families defeating the guard | **4** | **4** |
+
+The four survivors are identical in both runtimes, which is worth more than either row alone: the
+parser and client differences that separate the two labs everywhere else do not touch this guard.
+
+- `B15_metadata_service`, `B16_cgnat_range`, `B25_rfc1918_host` — all three answer on **port 80**,
+  which the allowlist permits by construction. Cloud metadata is the highest-value target in the
+  testbed and a port allowlist does not inconvenience it at all.
+- `B13_redirect` — the port is checked on the URL the application was handed, and the client then
+  follows that host somewhere else.
+
+So a port allowlist stops every port-based pivot -- the container API, the search cluster, the
+key-value stores, the whole service range -- and nothing else. It is the right guard for exactly
+one problem, and reading it as general protection is the mistake the measurement was built to
+catch.
+
 ### The same guard, two runtimes
 
 The report has a table that pairs variants by guard and injection shape across the two labs and

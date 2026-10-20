@@ -35,11 +35,21 @@ ALLOWED_HOST = "public.ssrefuse.test"
 ALLOWED_ORIGIN = "http://public.ssrefuse.test"
 BLOCKED_SUBSTRINGS = ["127.0.0.1", "localhost", "169.254.169.254"]
 BLOCKED_HOSTS = {"127.0.0.1", "localhost", "169.254.169.254", "0.0.0.0"}
+ALLOWED_PORTS = {80, 443}
 TIMEOUT = 4
 
 # Pending preview jobs, written by one route and consumed by another. The second
 # read is what makes the stored variant a second-order flow.
 PREVIEW_QUEUE: dict[str, dict] = {}
+
+# Webhooks registered by one request and delivered by another.
+WEBHOOKS: dict[str, str] = {}
+
+# The addresses this application treats as privileged, and the secret that
+# protects. Both are ordinary application code: the point of the variant is
+# that no SSRF guard anywhere else in this file knows they exist.
+TRUSTED_CLIENTS = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
+SELF_ADMIN_SECRET = "SSREFUSE-APP-SELF-ADMIN-SECRET"
 
 
 def _ok(body: str, **extra):
@@ -311,6 +321,32 @@ def preview_scheme_only():
 # @ssrefuse:end py-015
 
 
+# @ssrefuse:begin py-024
+@app.get("/preview/port-allowlist")
+def preview_port_allowlist():
+    """Allows only the ports a web service answers on.
+
+    This is the guard that the rest of the corpus was missing, and it is the
+    only one here that reasons about the port at all. It stops the pivot the
+    service-range family relies on: the container API, the search cluster and
+    the key-value stores all sit on ports of their own, and none of them is 80.
+
+    It is still a guard on one request. Anything that answers on an allowed
+    port is reachable, and anything that can move the fetch after the check
+    has run is unaffected.
+    """
+    url = request.args.get("url", "")
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return _blocked("scheme not allowed")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    if port not in ALLOWED_PORTS:
+        return _blocked(f"port {port} not allowed")
+    resp = requests.get(url, timeout=TIMEOUT)
+    return _ok(resp.text, status=resp.status_code, checked_port=port)
+# @ssrefuse:end py-024
+
+
 # ---------------------------------------------------------------------------
 # Sink diversity
 # ---------------------------------------------------------------------------
@@ -435,6 +471,100 @@ def preview_path_only():
 # @ssrefuse:end py-023
 
 
+# ---------------------------------------------------------------------------
+# Entry points: the feature that makes the application fetch a URL.
+#
+# Everything above varies the guard and holds the entry point fixed -- a URL
+# in a query string, a body field, a path segment. Real reports do not look
+# like that. They name a feature: a webhook, an identity provider's discovery
+# document, an avatar import. The feature decides which guards are even
+# possible, so it is the variable here, and the guard is held at the weakest
+# setting that still makes the route realistic.
+# ---------------------------------------------------------------------------
+
+# @ssrefuse:begin py-025
+@app.post("/webhooks")
+def webhook_register():
+    """Registers a webhook, validating the host at registration time.
+
+    The guard here is correct for the request it runs in. What it cannot
+    constrain is the request that happens later: the value is stored, and a
+    delivery runs against whatever the name resolves to then.
+    """
+    payload = request.get_json(silent=True) or {}
+    url = payload.get("url", "")
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if host != ALLOWED_HOST:
+        return _blocked("host not allowlisted at registration")
+    hook_id = str(len(WEBHOOKS) + 1)
+    WEBHOOKS[hook_id] = url
+    return jsonify({"ok": True, "hook_id": hook_id, "registered": url})
+# @ssrefuse:end py-025
+
+
+# @ssrefuse:begin py-026
+@app.post("/webhooks/<hook_id>/deliver")
+def webhook_deliver(hook_id: str):
+    """Delivers to a registered webhook. No check runs here.
+
+    This is the shape of the bug rather than an omission: the value was
+    validated once, by a different request, against an answer that is not
+    binding on this one. A name that resolved to the partner at registration
+    is free to resolve elsewhere now, and the delivery follows redirects
+    because a webhook that refused them would break on ordinary endpoints.
+    """
+    url = WEBHOOKS.get(hook_id)
+    if url is None:
+        return jsonify({"ok": False, "error": "no such webhook"}), 404
+    resp = requests.get(url, timeout=TIMEOUT)
+    return _ok(resp.text, status=resp.status_code, delivered_to=url)
+# @ssrefuse:end py-026
+
+
+# @ssrefuse:begin py-027
+@app.post("/sso/configure")
+def sso_configure():
+    """Fetches an identity provider's discovery document, then its keys.
+
+    The issuer is allowlisted and the fetch of the discovery document is
+    constrained by that. The second fetch is not: `jwks_uri` comes out of the
+    document, so the party that answers the first request chooses the
+    destination of the second one. A guard on user input never sees it,
+    because by then the value is not user input any more.
+    """
+    payload = request.get_json(silent=True) or {}
+    issuer = payload.get("issuer", "")
+    host = (urllib.parse.urlparse(issuer).hostname or "").lower()
+    if host != ALLOWED_HOST:
+        return _blocked("issuer not allowlisted")
+    discovery = requests.get(f"{issuer.rstrip('/')}/.well-known/openid-configuration",
+                             timeout=TIMEOUT)
+    try:
+        jwks_uri = discovery.json().get("jwks_uri", "")
+    except ValueError:
+        return _blocked("discovery document is not JSON")
+    keys = requests.get(jwks_uri, timeout=TIMEOUT)
+    return _ok(keys.text, status=keys.status_code, jwks_uri=jwks_uri)
+# @ssrefuse:end py-027
+
+
+# @ssrefuse:begin py-028
+@app.get("/internal/admin")
+def internal_admin():
+    """Privileged, and the only thing guarding it is where the request came from.
+
+    The address a request arrives from is not a credential. It says which
+    socket the kernel accepted, and any feature that makes this process send
+    a request makes that socket a loopback one. Nothing on this route is
+    broken in isolation; it becomes reachable because py-001 exists.
+    """
+    if request.remote_addr not in TRUSTED_CLIENTS:
+        return _blocked(f"admin is local-only, you are {request.remote_addr}")
+    return jsonify({"ok": True, "secret": SELF_ADMIN_SECRET,
+                    "caller": request.remote_addr})
+# @ssrefuse:end py-028
+
+
 @app.get("/")
 def index():
     routes = sorted(
@@ -450,4 +580,7 @@ if __name__ == "__main__":
     # the running process rather than off disk.
     print(f"LAB-READY name=flask_ssrf port={port} "
           f"routes={len(list(app.url_map.iter_rules())) - 1}", flush=True)
-    app.run(host="127.0.0.1", port=port, threaded=True, debug=False)
+    # Bound on every address inside the namespace, not only loopback: a route
+    # that trusts loopback can only be measured if the probe can arrive from
+    # somewhere else. Safe here because the namespace has no route out.
+    app.run(host="0.0.0.0", port=port, threaded=True, debug=False)

@@ -103,10 +103,24 @@ MARKER_METADATA_GUARDED = "SSREFUSE-METADATA-HEADER-GATED"
 MARKER_METADATA_ECS = "SSREFUSE-METADATA-ECS-TASK"
 MARKER_METADATA_ALIBABA = "SSREFUSE-METADATA-ALIBABA"
 
+# The application's own privileged route, which trusts the address a request
+# arrives from. It is not a testbed service: the lab serves it, and the only
+# way to see this canary is to make the lab fetch itself. Kept apart from
+# MARKER_INTERNAL so that "reached another service" and "reached its own
+# admin route" can never be read as the same finding.
+MARKER_SELF_ADMIN = "SSREFUSE-APP-SELF-ADMIN-SECRET"
+
 INTERNAL_MARKERS = (MARKER_INTERNAL, MARKER_METADATA, MARKER_CGNAT, MARKER_LOCALFILE,
                     MARKER_DOCKER, MARKER_ELASTIC, MARKER_CONSUL, MARKER_ACTUATOR,
                     MARKER_RFC1918, MARKER_REDIS, MARKER_MEMCACHED,
-                    MARKER_METADATA_GUARDED, MARKER_METADATA_ECS, MARKER_METADATA_ALIBABA)
+                    MARKER_METADATA_GUARDED, MARKER_METADATA_ECS, MARKER_METADATA_ALIBABA,
+                    MARKER_SELF_ADMIN)
+
+# The address the prober reaches a lab on when the variant asks for it. A lab
+# that trusts loopback has to be reachable from somewhere that is not
+# loopback, or the guard is satisfied by the attacker's own request and the
+# variant measures nothing.
+LAB_EXTERNAL_ADDRESS = IP_RFC1918
 
 SANDBOX_ROOT = "/tmp/ssrefuse-sandbox"
 SECRET_FILE = f"{SANDBOX_ROOT}/secret.txt"
