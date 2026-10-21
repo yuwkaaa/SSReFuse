@@ -1,5 +1,7 @@
 # SSReFuse
 
+<img src="docs/images/logo.png" alt="SSReFuse" width="340">
+
 SSRF detection that fuses static analysis with LLM reasoning, evaluated against a lab that runs
 rather than a corpus that is read.
 
@@ -7,6 +9,12 @@ The repository has three parts: a hermetic SSRF testbed, a classified catalog of
 three detector tiers (sink inventory, taint analysis, LLM judge) scored over one labelled corpus
 that spans two languages. The two labs implement the same guard taxonomy, so where a row of the
 matrix differs between them, the runtime is the finding.
+
+![An attacker posts a URL to a public endpoint; the server fetches it and ends up speaking to Redis on 127.0.0.1:6379, an address the attacker cannot reach directly](docs/images/ssrf-chain.png)
+
+That is the whole bug class in one line. The attacker never reaches `127.0.0.1:6379`; the
+server reaches it for them, and the port is open because nothing outside was ever supposed to
+ask. Everything below is an attempt to measure where that line actually stops.
 
 ## Why the ground truth is dynamic
 
