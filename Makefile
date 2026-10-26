@@ -3,10 +3,11 @@
 PY := .venv/bin/python
 VENV := .venv
 
-.PHONY: help venv validate selftest probe scan report judge judge-opencode all test clean
+.PHONY: help venv preflight validate selftest probe scan report judge judge-opencode bench all test clean
 
 help:
 	@echo "make venv      - create .venv and install dependencies"
+	@echo "make preflight - check this machine can run a bench, before running one"
 	@echo "make validate  - check the corpus against its source markers"
 	@echo "make selftest  - build the sandbox and prove it is hermetic"
 	@echo "make probe     - fire the payload catalog at every lab variant"
@@ -15,6 +16,7 @@ help:
 	@echo "make judge     - run the LLM judge (needs DEEPSEEK_API_KEY in .env)"
 	@echo "make judge-opencode - the same tier through a running opencode server, no key"
 	@echo "make all       - validate, probe, scan, report"
+	@echo "make bench     - preflight, then the full measurement including both judge arms"
 	@echo "make test      - run the test suite"
 
 $(VENV)/bin/python:
@@ -64,8 +66,32 @@ judge-opencode: venv
 	PYTHONPATH=. $(PY) -m ssrefuse.cli judge --provider opencode --model $(OC_MODEL) --effort high --rounds 2
 	PYTHONPATH=. $(PY) -m ssrefuse.cli report
 
+preflight: venv
+	PYTHONPATH=. $(PY) -m ssrefuse.cli preflight --provider $(PROVIDER) --effort off
+
 all: venv
 	PYTHONPATH=. $(PY) -m ssrefuse.cli all
+
+# One measurement, start to finish, for a machine that is not this one.
+# preflight runs first and exits non-zero on anything that would stop the run
+# part way, because a results directory from a half-finished bench looks like
+# a result. Then the corpus is validated, every payload is fired at every
+# variant, the static tiers run with their positive controls, both judge arms
+# run, and the report is rebuilt. Each step stops the chain on a non-zero exit.
+#
+# PROVIDER is the LLM transport. `deepseek` bills per token and reports its
+# token usage, which is what the thinking control reads; `opencode` spends a
+# subscription instead and reports no usage, so the control records that it
+# could not run. Both are real arms, they just answer different questions.
+PROVIDER ?= deepseek
+bench: venv
+	PYTHONPATH=. $(PY) -m ssrefuse.cli preflight --provider $(PROVIDER) --effort off
+	PYTHONPATH=. $(PY) -m ssrefuse.cli validate
+	PYTHONPATH=. $(PY) -m ssrefuse.cli probe
+	PYTHONPATH=. $(PY) -m ssrefuse.cli scan
+	PYTHONPATH=. $(PY) -m ssrefuse.cli judge --provider $(PROVIDER) --effort off  --rounds 2
+	PYTHONPATH=. $(PY) -m ssrefuse.cli judge --provider $(PROVIDER) --effort high --rounds 2
+	PYTHONPATH=. $(PY) -m ssrefuse.cli report
 
 test: venv
 	PYTHONPATH=. $(PY) -m pytest tests -q

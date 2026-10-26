@@ -92,6 +92,35 @@ make test        # 87 tests
 
 `make probe --apps flask_ssrf` (or `node_ssrf`) measures one lab on its own.
 
+### Running the whole thing somewhere else
+
+`make bench` is one measurement from start to finish, for a machine that is not
+the one it was built on:
+
+```sh
+make bench                      # preflight, validate, probe, scan, both judge arms, report
+make bench PROVIDER=opencode    # the same, through a local agent server instead of a vendor API
+```
+
+`make preflight` runs first and on its own. It checks the sandbox tooling
+(`unshare`, `ip`, `mount`, `ss`), semgrep, the corpus markers, the interpreter
+that will actually start each lab -- the project venv's, not whatever `python3`
+resolves to -- and each lab's declared runtime floor, plus the LLM transport if
+one is named. It exits non-zero on anything that would stop a run part way,
+because a results directory from a half-finished bench looks like a result.
+
+The runtime floor is enforced rather than documented. `php_ssrf` declares
+`min_runtime: 8.4.27` and the probe refuses to start it on anything lower: PHP
+8.4.0 through 8.4.26 are affected by CVE-2026-109618 and CVE-2026-109619, both
+unauthenticated RCE at CVSS v4.0 9.2, and this lab is fed attacker-shaped input
+by design. The version is read from the interpreter that is about to serve the
+requests and recorded next to the probe rows.
+
+`ssrefuse probe --apps <lab>` is for trying one lab and writes to its own
+`partial-*.json`. It leaves the aggregate the report reads untouched and says
+so, because it used to overwrite it -- after which a report said the other labs
+had no reproduced bypasses rather than that they had not been measured.
+
 The LLM tier needs an API key. Put it in `.env`, which is gitignored:
 
 ```sh

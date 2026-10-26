@@ -1,0 +1,8 @@
+cve,cwe,cvss,severity,app,ecosystem,affected,fixed,chain,buildable_here,blocker
+CVE-2026-27826,CWE-918,8.2,HIGH,mcp-atlassian,pypi,< 0.17.0,0.17.0,ssrf-entry,yes,none
+CVE-2026-27825,CWE-22/CWE-73,9.1,CRITICAL,mcp-atlassian,pypi,< 0.17.0,0.17.0,file-write-to-code-exec,yes,none
+CVE-2026-89111,CWE-918,10.0,CRITICAL,sap-cloud-sdk,pypi,< 0.45.2,0.45.2,credential-exfil,yes,none
+CVE-2026-116066,CWE-918,7.0,HIGH,firecrawl-server,github-selfhost,< 2.11.586,2.11.586,dns-rebinding-to-metadata,source,two-version-namespaces
+CVE-2026-44578,CWE-918,8.6,HIGH,next.js,npm,">= 13.4.13 < 15.5.16; >= 16.0.0 < 16.2.5",15.5.16/16.2.5,ssrf-proxy,docker-or-source,node-version-mismatch
+CVE-2026-2053,CWE-918,8.3,HIGH,wso2-api-manager,java,"3.1.0 < 3.1.0.360; 3.2.0 < 3.2.0.465; 4.0.0 < 4.0.0.385; 4.2.0 < 4.2.0.189",see-manifest-notes,ssrf-unauth,docker,no-javac
+CVE-2026-96652,CWE-918,4.3,MEDIUM,plex-media-server,closed-source,< 1.43.3.10861,1.43.3.10861,disputed,no,closed-source

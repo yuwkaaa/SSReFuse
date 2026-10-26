@@ -48,6 +48,115 @@ def cmd_validate(args) -> int:
     return 0
 
 
+def cmd_preflight(args) -> int:
+    """Can this machine run a bench, checked before a bench is started.
+
+    Written for the case where the measurement happens somewhere other than
+    the machine it was built on. Every failure below is one that would
+    otherwise surface in the middle of a run: a missing `unshare` after the
+    corpus validated, a PHP build under its floor after two labs had already
+    been probed, an API key that is absent only on the server. A run that dies
+    half way leaves a results directory that looks like a result.
+
+    Blocking and informational are kept apart. A missing `javac` blocks
+    nothing here because no Java lab runs; a missing `php` blocks the PHP lab
+    and therefore the corpus, so it blocks.
+    """
+    import shutil
+    import subprocess
+
+    from ssrefuse.harness.probe import LabProcess, _version_tuple
+
+    rows: list[tuple[str, str, str, bool]] = []   # area, what, detail, blocking-failure
+
+    def ok(area, what, detail=""):
+        rows.append((area, what, detail, False))
+
+    def fail(area, what, detail, blocking=True):
+        rows.append((area, what, detail, blocking))
+
+    # --- the sandbox the probe runs inside ---------------------------------
+    for tool in ("unshare", "ip", "mount", "ss"):
+        found = shutil.which(tool)
+        (ok if found else fail)("sandbox", tool, found or "not on PATH")
+
+    # --- the static tier ---------------------------------------------------
+    try:
+        from ssrefuse.detectors.semgrep_runner import semgrep_binary
+        ok("static", "semgrep", semgrep_binary())
+    except Exception as exc:
+        fail("static", "semgrep", str(exc)[:120])
+
+    # --- the corpus and the runtimes its labs need -------------------------
+    corpus = Corpus()
+    report = corpus.validate(set(FAMILY_BY_ID))
+    if report.problems:
+        fail("corpus", "ground truth", "; ".join(report.problems)[:160])
+    else:
+        counts = corpus.counts()
+        ok("corpus", "ground truth",
+           f"{counts['variants']} variants, {counts['apps']} apps, no mismatches")
+
+    for name, app in sorted(corpus.apps.items()):
+        probe = LabProcess.VERSION_PROBE.get(app.lang)
+        if probe is not None and app.lang == "python":
+            # Ask the interpreter that will actually start the lab. The bare
+            # `python3` on PATH here is 3.14 and has no semgrep, while the labs
+            # run on the project venv's 3.13 -- so probing PATH would report a
+            # version nothing under test is using.
+            probe = [_python_for_labs(getattr(args, "python", None))] + probe[1:]
+        if probe is None:
+            fail("runtime", f"{name} ({app.lang})",
+                 "no version probe for this language", blocking=bool(app.min_runtime))
+            continue
+        if shutil.which(probe[0]) is None:
+            fail("runtime", f"{name} ({app.lang})", f"{probe[0]} not on PATH")
+            continue
+        try:
+            found = subprocess.run(probe, capture_output=True, text=True,
+                                   timeout=20).stdout.strip()
+        except (OSError, subprocess.SubprocessError) as exc:
+            fail("runtime", f"{name} ({app.lang})", f"cannot read version: {exc}")
+            continue
+        if app.min_runtime and _version_tuple(found) < _version_tuple(app.min_runtime):
+            fail("runtime", f"{name} ({app.lang})",
+                 f"{found} is below the declared floor {app.min_runtime}")
+        else:
+            floor = f", floor {app.min_runtime}" if app.min_runtime else ""
+            ok("runtime", f"{name} ({app.lang})", f"{found}{floor}")
+
+    # --- the LLM tier, if a bench is going to run it -----------------------
+    if args.provider:
+        from ssrefuse.llm.client import LLMClient, LLMUnavailable
+        try:
+            client = LLMClient(provider=args.provider, model=args.model,
+                               reasoning_effort=args.effort)
+            client.check_ready()
+            described = client.describe()
+            note = f"{described['transport']}, model {described['model']}"
+            if not described["capabilities"]["usage_reported"]:
+                note += " (reports no token usage: the thinking control cannot run)"
+            ok("llm", args.provider, note)
+        except LLMUnavailable as exc:
+            fail("llm", args.provider, str(exc)[:160])
+
+    width = max(len(w) for _, w, _, _ in rows)
+    blocking = 0
+    for area, what, detail, is_blocking in rows:
+        if is_blocking:
+            blocking += 1
+        print(f"  [{'FAIL' if is_blocking else 'ok  '}] {area:<8} "
+              f"{what:<{width}}  {detail}")
+    print()
+    if blocking:
+        print(f"{blocking} blocking problem(s): this machine cannot produce a "
+              f"complete measurement. Nothing was run.", file=sys.stderr)
+        return 1
+    print("preflight passed: every tier a bench needs is present and within its "
+          "declared floors.")
+    return 0
+
+
 def cmd_selftest(args) -> int:
     from ssrefuse.harness.sandbox import run_in_sandbox
     result = run_in_sandbox({"job": "selftest"}, RESULTS / "selftest")
@@ -70,8 +179,17 @@ def cmd_selftest(args) -> int:
 def cmd_probe(args) -> int:
     from ssrefuse.harness.sandbox import run_in_sandbox
     plan = {"job": "probe", "python": _python_for_labs(args.python)}
+    partial_path = None
     if args.apps:
         plan["apps"] = args.apps
+        # A subset run goes to its own file. It used to land on the aggregate
+        # the report reads, which meant `probe --apps php_ssrf` silently
+        # deleted the dynamic evidence for every other lab -- and a report
+        # built afterwards said those labs had no reproduced bypasses rather
+        # than that they had not been measured this time.
+        partial_path = (RESULTS / "probe"
+                        / ("partial-" + "-".join(sorted(args.apps)) + ".json"))
+        plan["result_path"] = str(partial_path)
     result = run_in_sandbox(plan, RESULTS / "probe", timeout=args.timeout)
     if not result.get("ok"):
         print(f"probe failed: {result.get('error')}", file=sys.stderr)
@@ -82,7 +200,17 @@ def cmd_probe(args) -> int:
         print(f"{run['app']}: {lab['ready_line']} "
               f"(pid {lab['pid']}, port held by {lab['port_owner_pid']})")
         print(f"  probe rows: {len(run['outcomes'])}")
-    print(f"\nwrote {PROBE_RESULT}")
+        if run["lab"].get("min_runtime"):
+            print(f"  runtime: {run['lab']['runtime_version']} "
+                  f"(floor {run['lab']['min_runtime']}, checked before start)")
+    if partial_path is not None:
+        print(f"\nwrote {partial_path}")
+        print(f"--apps was given, so this is a SUBSET run and it did NOT touch "
+              f"{PROBE_RESULT.name}. The report reads that file, so these rows "
+              f"will not appear in it. Re-run `ssrefuse probe` with no --apps "
+              f"for numbers that go anywhere.", file=sys.stderr)
+    else:
+        print(f"\nwrote {PROBE_RESULT}")
     return 0
 
 
@@ -458,6 +586,16 @@ def main(argv: list[str] | None = None) -> int:
         func=cmd_validate)
     sub.add_parser("selftest", help="build the sandbox and prove it is hermetic").set_defaults(
         func=cmd_selftest)
+
+    pre = sub.add_parser("preflight",
+                         help="check this machine can run a bench, before running one")
+    pre.add_argument("--provider", default=None,
+                     help="also check the LLM tier for this provider; omitted "
+                          "means the static and dynamic tiers only")
+    pre.add_argument("--model", default=None)
+    pre.add_argument("--effort", default="none", choices=REASONING_EFFORTS)
+    pre.add_argument("--python", help="interpreter the labs will be started with")
+    pre.set_defaults(func=cmd_preflight)
 
     probe = sub.add_parser("probe", help="run every payload against every variant")
     probe.add_argument("--apps", nargs="*", help="limit to these applications")

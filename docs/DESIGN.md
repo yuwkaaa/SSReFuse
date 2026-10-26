@@ -34,7 +34,7 @@ extension and raises on one it has no slicer for, so a language added to the cor
 fall through to the Python parser and come back as a fixed-size window.
 
 `ssrefuse/slicing_js.py` produces the same shape for JavaScript without a parser, because adding one
-costs an npm tree. One character scan classifies every position as code, comment, string, template
+costs a dependency tree that the results would then partly be about. One character scan classifies every position as code, comment, string, template
 or regex, and both consumers read it: the comment stripper, and the bracket counter that finds
 top-level statement boundaries. The weakness of a scanner against a parser is handled by making it
 visible rather than by assuming it away. The one genuinely ambiguous construct in JavaScript

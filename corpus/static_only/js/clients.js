@@ -1,10 +1,17 @@
 /*
  * Static-only corpus: JavaScript HTTP clients that need a package tree.
  *
- * The Node lab uses the standard library because npm is not available on the
- * build machine, so axios, got, superagent and express never appear in code
- * that runs. They are the clients real services use, and a rule that only
- * matches fetch and http.get would look better than it is.
+ * The Node lab uses the standard library and installs nothing, so axios, got,
+ * superagent and express never appear in code that runs. They are the clients
+ * real services use, and a rule that only matches fetch and http.get would
+ * look better than it is.
+ *
+ * The reason is a dependency tree, not a missing tool: a lab whose results
+ * depend on a few hundred third-party packages is a lab whose results are
+ * partly about those packages. (An earlier version of this comment said npm
+ * was unavailable on the build machine. It is installed, in a self-contained
+ * prefix rather than on PATH, which is a different statement -- and the
+ * stronger reason stands on its own.)
  *
  * Nothing here runs. These functions exist so the sink-inventory rules are
  * measured against the shapes they will meet outside this repository, and

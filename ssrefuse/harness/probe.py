@@ -95,6 +95,26 @@ class Outcome:
         }
 
 
+def _version_tuple(text: str) -> tuple[int, ...]:
+    """Leading numeric components, so `8.4.27-1` and `8.4.27` compare equal.
+
+    Anything non-numeric stops the parse rather than being guessed at: a
+    version this cannot read must not silently compare as zero and let a lab
+    start below its floor.
+    """
+    parts: list[int] = []
+    for chunk in str(text).strip().split("."):
+        digits = ""
+        for char in chunk:
+            if not char.isdigit():
+                break
+            digits += char
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts) or (-1,)
+
+
 class LabProcess:
     """A lab application under test, started as a child process.
 
@@ -110,8 +130,10 @@ class LabProcess:
         self.python = python or sys.executable
         self.proc: subprocess.Popen | None = None
         self.ready_line = ""
+        self.runtime_version = ""
 
     def start(self, timeout: float = 25.0) -> dict:
+        self._check_min_runtime()
         cmd = [arg.replace("{port}", str(self.port)) for arg in self.app.start]
         if cmd[0] == "python":
             cmd[0] = self.python
@@ -165,6 +187,53 @@ class LabProcess:
         raise RuntimeError(f"lab {self.app.name} did not come up on port "
                            f"{self.port}: {detail}\n{text[-1500:]}")
 
+    # How to ask each runtime its own version. The answer comes from the
+    # interpreter that is about to run the lab, not from a package manager and
+    # not from a file on disk, because what matters is the build that will
+    # serve the requests.
+    VERSION_PROBE = {
+        "php": ["php", "-r", "echo PHP_VERSION;"],
+        "javascript": ["node", "-p", "process.versions.node"],
+        "python": ["python3", "-c", "import platform;print(platform.python_version())"],
+    }
+
+    def _check_min_runtime(self) -> None:
+        """Refuse to start a lab on a runtime below its declared floor.
+
+        The floor exists because of PHP: serving HTTP from a build below
+        8.4.27 serves it from one affected by CVE-2026-109618 and
+        CVE-2026-109619, both unauthenticated RCE at CVSS v4.0 9.2, and this
+        lab is fed attacker-shaped input by design. Declaring the floor in
+        ground truth and never reading it would be a value collected and
+        dropped -- which is the shape of every silent gap in this project.
+        """
+        floor = getattr(self.app, "min_runtime", "")
+        if not floor:
+            return
+        probe = self.VERSION_PROBE.get(self.app.lang)
+        if probe is None:
+            raise RuntimeError(
+                f"{self.app.name} declares min_runtime {floor!r} and there is no "
+                f"version probe for language {self.app.lang!r}. Add one to "
+                f"LabProcess.VERSION_PROBE rather than skipping the check: an "
+                f"unenforced floor is worse than no floor, because it reads as "
+                f"enforced.")
+        try:
+            done = subprocess.run(probe, capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"cannot ask {self.app.lang} its version "
+                               f"({' '.join(probe)}): {exc}") from exc
+        found = done.stdout.strip()
+        if _version_tuple(found) < _version_tuple(floor):
+            raise RuntimeError(
+                f"{self.app.name} needs {self.app.lang} >= {floor} and this one "
+                f"is {found or '(no answer)'}. Refusing to measure. For PHP the "
+                f"floor is a security floor, not a feature one: 8.4.0 to 8.4.26 "
+                f"are affected by CVE-2026-109618 and CVE-2026-109619, both "
+                f"unauthenticated RCE, and this lab serves attacker-shaped "
+                f"input.")
+        self.runtime_version = found
+
     def _marks_ready(self, line: str) -> bool:
         if self.app.ready_match == "contains":
             return self.app.ready_marker in line
@@ -197,7 +266,12 @@ class LabProcess:
             pass
         return {"pid": self.proc.pid if self.proc else None, "port_owner_pid": owner,
                 "ready_line": self.ready_line, "log": str(self.log_path),
-                "command": " ".join(self.app.start)}
+                "command": " ".join(self.app.start),
+                # Recorded only when a floor was declared and therefore checked.
+                # An empty string here means "no floor to check", not "checked
+                # and unknown".
+                "runtime_version": self.runtime_version,
+                "min_runtime": getattr(self.app, "min_runtime", "")}
 
     def stop(self) -> None:
         if self.proc and self.proc.poll() is None:
