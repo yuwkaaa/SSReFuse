@@ -7,7 +7,7 @@ rather than a corpus that is read.
 
 The repository has three parts: a hermetic SSRF testbed, a classified catalog of bypass payloads, and
 three detector tiers (sink inventory, taint analysis, LLM judge) scored over one labelled corpus
-that spans two languages. The two labs implement the same guard taxonomy, so where a row of the
+that spans three languages. The three labs implement the same guard taxonomy, so where a row of the
 matrix differs between them, the runtime is the finding.
 
 ![An attacker posts a URL to a public endpoint; the server fetches it and ends up speaking to Redis on 127.0.0.1:6379, an address the attacker cannot reach directly](docs/images/ssrf-chain.png)
@@ -112,7 +112,18 @@ ssrefuse report
 `--effort none` is not `--effort low`: one omits the parameter, the other asks
 for a small budget, and conflating them would attribute the provider's default
 to this project. The cache is keyed on the effort as well as the prompt, so
-neither arm can be served the other's answers. What the thinking cost is
+neither arm can be served the other's answers.
+
+The ablation's whole claim is that its two arms ran at different budgets, and
+nothing in the verdict columns shows whether they did -- an arm labelled `off`
+that thought anyway returns a complete, plausible table. So the budget is
+checked against the provider's own token accounting, both ways: `off` must
+have spent no reasoning tokens, and `low`/`high`/`max` must have spent some.
+A failure exits non-zero and the report leaves that arm out of the comparison
+and names it, because a thinking arm that did not think makes the ablation one
+arm measured twice. `none` claims nothing and is checked for nothing. On a
+transport that reports no usage the control comes back `not_checked`, which is
+not the same as passing: the budget is unknown, not zero. What the thinking cost is
 recorded per judgement from the provider's own accounting, because "the
 reasoning tier scored higher" and "scored higher at nine times the tokens" are
 different findings.
@@ -122,6 +133,52 @@ previous ones were already stale: `deepseek-chat` and `deepseek-reasoner`
 selected non-thinking and thinking mode and were scheduled for retirement on
 2026-07-24. Re-check before a submission. `--provider openrouter` and
 `--provider openai-compatible` reach the same chat-completions shape elsewhere.
+
+### Two kinds of backend
+
+A model is reached here either by calling a vendor's API with a key, or by
+handing the prompt to an agent tool that already holds one. Both are kept,
+because they fail in opposite directions and the choice per arm is a real one.
+
+```sh
+opencode service start            # the server this transport talks to
+opencode models                   # ids, as `provider/model`
+ssrefuse judge --provider opencode --model opencode-go/deepseek-v4.1-flash \
+                --effort high --rounds 2
+```
+
+The agent transport needs no key in `.env` and costs nothing per call beyond
+the subscription the account already has, which is what makes a second
+provider affordable at all: the same candidate set judged by two models is a
+check on whether a result belongs to the method or to one vendor's model. On
+some machines it is also the only way in, because the gateway's proxy refuses
+an ordinary HTTP client from this host with `403 error code: 1010` -- a
+client-signature rejection, identical for a valid and an invalid token, so
+that response says nothing about credentials.
+
+What it gives up is accounting, and the report says so rather than filling the
+gap:
+
+| | vendor API | agent transport |
+|---|---|---|
+| key needed here | yes | no |
+| token usage | reported | **`n/a`, never `0`** |
+| chain of thought | returned in its own field | not returned |
+| temperature | sent | not settable |
+| JSON mode | requested | unavailable; answer parsed from prose |
+| thinking budget | request parameter, incl. `off` | declared model variant; **no `off`** |
+
+The thinking budget is still a real knob on the agent transport rather than a
+hopeful one: the server validates the variant and rejects an undeclared value
+with HTTP 400, so `--effort high` either ran at `high` or failed loudly. The
+`off` arm is the exception -- no variant disables thinking, so asking for it
+raises and points at `--provider deepseek` instead of quietly running the
+model's default under a label that claims otherwise.
+
+The provider half of a model id is the billing tier, not decoration:
+`opencode-go/...` draws on the subscription, the `opencode/...` mirror of the
+same model is pay-per-token, and `...-free` has a daily ceiling. A spent
+budget comes back as a terminal error and is raised rather than retried.
 
 Every command loads `.env` before it runs and prints which variables it set,
 by name and never by value. A variable already exported in the shell wins over
@@ -134,16 +191,41 @@ report states that those rows are not measurements.
 
 ## Corpus
 
-46 variants, 36 vulnerable and 10 safe, across two labs that implement the same guard taxonomy:
+72 variants, 55 vulnerable and 17 safe, across three labs that implement the same guard taxonomy:
 
 | lab | file | variants | runtime |
 |---|---|---|---|
-| `flask_ssrf` | `corpus/labs/flask_ssrf/app.py` | 23 (18 vulnerable, 5 safe) | Flask, `requests` / `httpx` / `urllib` / curl |
-| `node_ssrf` | `corpus/labs/node_ssrf/app.js` | 23 (18 vulnerable, 5 safe) | Node standard library, `fetch` / `http.get` / curl |
+| `flask_ssrf` | `corpus/labs/flask_ssrf/app.py` | 28 | Flask, `requests` / `httpx` / `urllib` / curl |
+| `node_ssrf` | `corpus/labs/node_ssrf/app.js` | 28 | Node standard library, `fetch` / `http.get` / curl |
+| `php_ssrf` | `corpus/labs/php_ssrf/app.php` | 16 (13 vulnerable, 3 safe) | PHP built-in server, `file_get_contents` / `curl_exec` |
 
 Each variant is one route with one guard, from nothing at all (`G0`) to a correct one (`G8`: resolve
-once, classify the address, connect to that same address, refuse redirects). The five safe routes in
+once, classify the address, connect to that same address, refuse redirects). The safe routes in
 each lab are the false-positive control set, and each has to record why it is safe.
+
+The PHP lab is not there to make the count larger. It is there because two of the guards answer
+differently in PHP, and both differences were measured on 8.4.27 rather than assumed:
+
+* **`parse_url()` does not canonicalise the authority.** `2130706433`, `0177.0.0.1`, `0x7f000001`,
+  `127.1` and `127.0.0.1.` all come back verbatim, where Node's `URL()` rewrites every one of them
+  to `127.0.0.1`. The host-denylist row therefore holds in one lab and falls in the other with the
+  same guard code. Confirmed on the running app: `url=http://127.0.0.1/` is blocked and
+  `url=http://2130706433/` passes the guard.
+* **`filter_var(..., NO_PRIV_RANGE|NO_RES_RANGE)` calls three addresses public** that a reader would
+  expect it to reject: `100.64.0.10` (CGNAT), `100.100.100.200` (Alibaba metadata) and `203.0.113.5`
+  — the last of which Python's `ipaddress` calls private. A resolve-and-classify guard built on it
+  has holes the same guard in Python does not.
+
+`php-012` and `php-014` are the pair that makes this readable: identical resolve-and-pin mechanism,
+one predicate each, and only the one built on `filter_var` is reachable. The hole is the predicate,
+not the pinning, and the pair is the evidence rather than the assertion.
+
+PHP also widens the sink surface. `file_get_contents` reaches every stream wrapper the build has —
+`file`, `php`, `data`, `glob`, `phar`, `zip` — so one call is both an HTTP client and a file reader;
+and `curl_version()['protocols']` lists `dict`, `gopher`, `ldap`, `telnet` and `tftp` in-process,
+where the Python lab reaches that surface only by shelling out to the curl binary. A URL handed to
+`curl_setopt($ch, CURLOPT_URL, $url)` is also two statements away from the call that sends the
+request, which is a different thing for a taint engine to follow than a single tainted argument.
 
 Every route calls its own sink rather than sharing a fetch helper. The shared helper is the better
 code and the worse benchmark: with one helper, every static finding lands on the same two lines and
@@ -156,13 +238,13 @@ and prints every mismatch.
 
 ## Current numbers
 
-Over all 46 variants, scored against the declared labels:
+Over all 72 variants, scored against the declared labels:
 
 | detector | TP | FP | FN | TN | precision | recall |
 |---|---|---|---|---|---|---|
-| sink inventory | 36 | 8 | 0 | 2 | 0.818 | 1.000 |
-| taint, no sanitizers | 31 | 6 | 5 | 4 | 0.838 | 0.861 |
-| taint, naive sanitizers | 31 | 6 | 5 | 4 | 0.838 | 0.861 |
+| sink inventory | 55 | 11 | 0 | 6 | 0.833 | 1.000 |
+| taint, no sanitizers | 48 | 8 | 7 | 9 | 0.857 | 0.873 |
+| taint, naive sanitizers | 48 | 8 | 7 | 9 | 0.857 | 0.873 |
 
 Split by language, because a single row would hide which half carries which error:
 
@@ -326,7 +408,13 @@ of the difference, each measured on Node v24.19.0 before the lab was written:
 
 ## Limitations
 
-- Two labs exist, Python and JavaScript. The PHP lab is not written, and CodeQL has not been run.
+- CodeQL has not been run. The brief names "Semgrep/CodeQL", and Semgrep answers it; a second
+  engine would strengthen the comparison and is not required by it.
+- The PHP lab's declared bypasses are claims until the prober reproduces them. The report lists
+  every declaration that has not reproduced, by variant, rather than reporting a coverage figure
+  that counts them as met.
+- Java has sink-inventory fixtures and no runnable lab, so its findings answer "which sinks does the
+  rule see" and never enter the scored table. That separation is in the code, not only in prose.
 - The escalation column in the report is written down, not executed. Reaching the Docker API is
   measured; creating a container with the host filesystem mounted is not, and the report says so
   wherever the column appears.

@@ -70,6 +70,25 @@ apps:
     start: ["node", "corpus/labs/node_ssrf/app.js", "{port}"]
     ready_marker: LAB-READY
     framework: node-http
+  php_ssrf:
+    lang: php
+    file: corpus/labs/php_ssrf/app.php
+    # The built-in server is the router: it runs app.php per request, so the app
+    # has no startup hook to print a marker from. The marker is therefore the
+    # server's own banner, which still comes from the running process and
+    # carries its version -- rather than a wrapper script echoing a ready line
+    # the server never confirmed.
+    start: ["php", "-S", "127.0.0.1:{port}", "corpus/labs/php_ssrf/app.php"]
+    ready_marker: Development Server
+    # The built-in server timestamps every line it writes, so the marker can
+    # never be at column zero the way the other two labs' LAB-READY is.
+    ready_match: contains
+    framework: php-builtin
+    # Runtime floor, and it is a security floor rather than a feature one.
+    # Serving HTTP from PHP below 8.4.27 serves it from a build affected by
+    # CVE-2026-109618 and CVE-2026-109619 (both CVSS v4.0 9.2, unauthenticated
+    # RCE), and this lab is fed attacker-shaped input by design.
+    min_runtime: "8.4.27"
 
 variants:
   - id: py-001
@@ -908,3 +927,313 @@ variants:
     bypasses_declared: []
     no_sink: true
     entry_point: E3_privileged_route
+
+  - id: php-001
+    app: php_ssrf
+    sink: file_get_contents
+    guards: [G0_none]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/direct, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B01_plain_loopback, B07_dns_to_internal, B15_metadata_service,
+                        B16_cgnat_range, B17_file_scheme, B24_internal_service_range,
+                        B25_rfc1918_host]
+    notes: >
+      The sink the assignment names first, with nothing in front of it. B17 is
+      declared here and not on the Python or JavaScript no-guard routes
+      because file_get_contents reaches every stream wrapper the build has:
+      measured on 8.4.27 those are https, ftps, compress.zlib, php, file, glob,
+      data, http, ftp, phar and zip, with allow_url_fopen on. One call is both
+      an HTTP client and a file reader.
+      B35_self_admin was declared here and withdrawn after the probe: it aims
+      at the application's own privileged route, and this lab has none. The
+      family is not weaker than the others, it has no target here.
+
+  - id: php-002
+    app: php_ssrf
+    sink: curl_exec
+    guards: [G0_none]
+    flow: F0_direct
+    observability: blind
+    label: vulnerable
+    entry: {method: GET, path: /preview/blind, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B01_plain_loopback, B22_gopher_scheme,
+                        B23_dict_scheme, B33_ldap_scheme]
+    notes: >
+      The body is discarded, so the access log and the DNS log are the only
+      oracles. The scheme families are declared here because PHP's curl
+      extension carries them in-process: curl_version()['protocols'] on this
+      build lists dict, gopher, ldap, telnet, tftp and smtp among others. The
+      Python lab reaches the same surface only by shelling out to the curl
+      binary, and a subprocess argument is a different thing for a taint
+      engine to see than a URL handed to curl_setopt.
+      B18_oob_callback was declared and withdrawn: it did not reproduce here,
+      and it is listed in the report's unreproduced column rather than quietly
+      dropped. Not investigated further yet, and that is a limit of this row
+      rather than a property of the route.
+
+  - id: php-003
+    app: php_ssrf
+    sink: file_get_contents
+    guards: [G1_denylist_substring]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/denylist-string, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B02_loopback_alias, B03_decimal_ip, B04_octal_ip, B05_hex_ip,
+                        B07_dns_to_internal, B16_cgnat_range]
+    notes: >
+      The check reads the raw string and never parses it, so every alternative
+      spelling of the same address is a different string.
+
+  - id: php-004
+    app: php_ssrf
+    sink: file_get_contents
+    guards: [G2_denylist_host]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/denylist-host, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B03_decimal_ip, B04_octal_ip, B05_hex_ip, B07_dns_to_internal,
+                        B08_trailing_dot, B16_cgnat_range]
+    notes: >
+      The row this lab exists for. The guard is the same guard as the
+      JavaScript lab's host denylist and it does not hold here, because
+      parse_url() returns the authority as written: measured on 8.4.27,
+      '2130706433', '0177.0.0.1', '0x7f000001', '127.1' and '127.0.0.1.' all
+      come back verbatim, where Node's URL() rewrites every one of them to
+      '127.0.0.1'. Confirmed by hand on the running app: url=http://127.0.0.1/
+      is blocked and url=http://2130706433/ passes the guard. Same denylist,
+      different parser, different column.
+      Declared deliberately absent: B09, B11 and B12. parse_url was measured
+      not to be fooled by them -- it takes the last '@' like a browser, and it
+      handles the fragment and a percent-encoded slash in userinfo correctly.
+
+  - id: php-005
+    app: php_ssrf
+    sink: file_get_contents
+    guards: [G3_allowlist_prefix]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/allow-prefix, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B09_userinfo_confusion, B10_subdomain_suffix]
+    notes: >
+      str_starts_with is correct about how the URL begins and says nothing
+      about where the authority ends. Note that the wrapper families work here
+      while they fail on php-004: the difference is not the parser, it is that
+      this guard never asks the parser anything.
+      B11, B12 and B28 were declared and withdrawn on the measurement. They
+      carry the allowlisted name in a query, a fragment or behind extra
+      slashes, which defeats an allowlist that searches *anywhere* in the
+      string -- php-010's pattern, not this one. A prefix test requires the
+      name at the front, so those three have nowhere to put it. Declaring them
+      here was reasoning by family rather than by guard.
+
+  - id: php-006
+    app: php_ssrf
+    sink: file_get_contents
+    guards: [G9_scheme_only]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/scheme-only, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B01_plain_loopback, B07_dns_to_internal, B15_metadata_service,
+                        B24_internal_service_range]
+    notes: >
+      A guard that is completely effective on one axis and irrelevant on
+      another. It closes the wrapper surface that makes file_get_contents
+      unusual -- B17 is declared absent here on purpose, and it should stay
+      absent -- and leaves every internal HTTP target reachable.
+
+  - id: php-007
+    app: php_ssrf
+    sink: file_get_contents
+    guards: [G7_resolve_check_public]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/resolve-check, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B14_dns_rebinding, B16_cgnat_range]
+    notes: >
+      Two holes of different kinds, which is why this route is worth a row of
+      its own. The predicate is wrong: filter_var with
+      NO_PRIV_RANGE|NO_RES_RANGE was measured on 8.4.27 to call 100.64.0.10 and
+      100.100.100.200 public, and to call 203.0.113.5 public where Python's
+      ipaddress calls it private. And the fetch re-resolves the name, so even a
+      correct predicate would only have described the first of two lookups.
+
+  - id: php-008
+    app: php_ssrf
+    sink: curl_exec
+    guards: [G6_allowlist_host_noredirect, G9_scheme_only]
+    flow: F0_direct
+    observability: reflected
+    label: safe
+    entry: {method: GET, path: /preview/allow-host-noredirect, inject: query, param: url, payload_kind: url}
+    bypasses_declared: []
+    why_safe: >
+      The counterpart of py-012 and js-013, safe for the same reasons: the
+      hostname is compared exactly, so no spelling or wrapper family has a
+      place to stand, and redirects are refused, so the one door that is open
+      in php-009 is shut here.
+      This row was first declared `vulnerable` on the strength of
+      B14_dns_rebinding and the probe reproduced no bypass at all, which is
+      also what the Python and JavaScript labs say about the same guard. The
+      label follows the measurement. CURLOPT_PROTOCOLS was added at the same
+      time rather than left implicit: PHP's curl carries dict, gopher, ldap,
+      telnet and tftp, and a gopher URL on the allowlisted host would have
+      satisfied a check that only looked at the host.
+
+  - id: php-009
+    app: php_ssrf
+    sink: file_get_contents
+    guards: [G5_allowlist_host_redirects]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/allow-host-redirect, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B13_redirect]
+    notes: >
+      B14_dns_rebinding was declared here and withdrawn: it did not reproduce,
+      and php-008 -- the same allowlist with the redirect door shut -- produced
+      nothing at all. Between those two rows the measured difference is the
+      redirect and only the redirect, which is a cleaner statement than the one
+      that was declared.
+      Written with file_get_contents rather than curl for a reason: PHP's http
+      stream wrapper follows Location by default, so this route does not have
+      to opt in to the behaviour that breaks it. The Node and Python
+      equivalents both had to ask for redirects explicitly.
+
+  - id: php-010
+    app: php_ssrf
+    sink: file_get_contents
+    guards: [G10_regex_unanchored]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/allow-regex, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B10_subdomain_suffix]
+    notes: >
+      The pattern is anchored at the start and open at the end, so a longer
+      name beginning the same way satisfies it. B11 and B12 were declared and
+      withdrawn: unanchored at the end still means anchored at the start, so a
+      name carried in a query or a fragment never gets to the front.
+
+  - id: php-011
+    app: php_ssrf
+    sink: file_get_contents
+    guards: [G12_path_concat_unvalidated]
+    flow: F3_assembled
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/assembled, inject: query, param: host, payload_kind: host}
+    bypasses_declared: [B01_plain_loopback, B07_dns_to_internal,
+                        B24_internal_service_range]
+    notes: >
+      Only the authority is tainted and the rest of the URL is literal, so the
+      taint has to be carried through a concatenation rather than read off a
+      single argument. Shaped to match the Python lab's assembled route so the
+      two are comparable.
+      B15_metadata_service was declared and withdrawn, and the reason is worth
+      keeping: this route appends a fixed `/feed.json`, and the metadata canary
+      answers on its own path. Controlling the authority is not enough when the
+      path is a literal -- which is a real property of assembled-URL routes and
+      not a gap in the catalog.
+
+  - id: php-012
+    app: php_ssrf
+    sink: curl_exec
+    guards: [G8_resolve_pin_connect]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/resolve-pin, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B16_cgnat_range]
+    notes: >
+      The mechanism is right and the predicate is wrong, and the result reads
+      as careful code. CURLOPT_RESOLVE closes the check-to-fetch gap, so
+      rebinding has nothing to move -- B14 is declared absent here and absent
+      is the correct answer. What survives is the one range filter_var was
+      measured to pass. Compare php-014, which differs in the predicate alone
+      and is labelled safe: the pair is the evidence that the hole is the
+      predicate rather than the pinning.
+
+  - id: php-013
+    app: php_ssrf
+    sink: file_get_contents
+    guards: [G11_guard_wrong_value]
+    flow: F0_direct
+    observability: reflected
+    label: vulnerable
+    entry: {method: GET, path: /preview/guard-wrong-value, inject: query, param: url, payload_kind: url}
+    bypasses_declared: [B21_decoded_delimiter]
+    notes: >
+      Rewritten after the probe, and the first version is the lesson. It
+      validated 'url' and fetched 'src', so a request carrying only the
+      payload failed the check on the empty parameter and the route answered
+      403 to everything -- including its own benign control, which is how the
+      report caught it. A variant the probe cannot reach is not a hard variant,
+      it is an absent one, and it would have sat in the corpus as a permanent
+      false negative for every tier.
+      Now it matches py-021 and js-021: decode, validate the decoded copy,
+      fetch the raw one. A percent-encoded delimiter gives the two copies
+      different authorities, and the raw one is what reaches the sink.
+
+  - id: php-014
+    app: php_ssrf
+    sink: curl_exec
+    guards: [G8_resolve_pin_connect, G17_port_allowlist, G9_scheme_only]
+    flow: F0_direct
+    observability: reflected
+    label: safe
+    entry: {method: GET, path: /preview/resolve-pin-strict, inject: query, param: url, payload_kind: url}
+    bypasses_declared: []
+    why_safe: >
+      The resolve-and-pin shape with a predicate that is right. The rejected
+      ranges are listed explicitly, including the two filter_var was measured
+      to miss (100.64.0.0/10 and 100.100.100.200/32), the connection is pinned
+      to the address that was checked, redirects are refused, CURLOPT_PROTOCOLS
+      is restricted to http and https, and the port must be one a web service
+      answers on. It differs from php-012 in the predicate alone, which is what
+      makes that pair readable.
+
+  - id: php-015
+    app: php_ssrf
+    sink: file_get_contents
+    guards: [G0_none]
+    flow: F0_direct
+    observability: reflected
+    label: safe
+    entry: {method: GET, path: /preview/fixed-target, inject: none, payload_kind: none}
+    no_user_input: true
+    bypasses_declared: []
+    why_safe: >
+      No attacker-controlled character reaches the URL: the query parameter is
+      a cache label and the destination is a literal. The guard list says
+      G0_none because there is no guard, and there does not need to be one --
+      this row is the false-positive control for the sink itself, and a rule
+      that flags it is not wrong about the sink, only about the flow.
+
+  - id: php-016
+    app: php_ssrf
+    sink: file_get_contents
+    guards: [G0_none]
+    flow: F2_container
+    observability: reflected
+    label: safe
+    entry: {method: GET, path: /preview/indirect-choice, inject: none, payload_kind: none}
+    no_user_input: true
+    bypasses_declared: []
+    why_safe: >
+      The allowlist the assignment asks about, done the way that holds: the
+      input selects a key in a table the application wrote, so the attacker
+      chooses among destinations and never contributes a character to one. The
+      flow is F2_container because the URL is read out of a structure, which is
+      the shape a container-aware taint engine is most likely to flag.
+      `inject: none` with `no_user_input` rather than injecting into `feed`:
+      the parameter is a key, not a URL, so a payload placed in it is rejected
+      before any fetch and even the benign control cannot be delivered. The
+      report flagged exactly that, and marking the route honestly is better
+      than leaving a control that can never pass.

@@ -1,0 +1,50 @@
+# Interprocedural taint from a request superglobal to an outbound request sink
+# in PHP, with no sanitizer declared. Everything the application does to
+# validate the URL is invisible to this configuration on purpose: it isolates
+# how much of the result comes from reachability alone, before any claim about
+# guards.
+#
+# PHP puts one shape in front of this rule that neither Python nor JavaScript
+# does. curl_exec() does not take a URL: the destination arrives at curl_init()
+# or, more often in real code, at a later curl_setopt($ch, CURLOPT_URL, $url).
+# So the sink for a curl flow is the option write, two statements away from the
+# call that sends the request, and a rule anchored on the sending call sees
+# nothing. That is a fact about the language, and the point of listing both.
+rules:
+  - id: ssrefuse-php-taint-nosan
+    mode: taint
+    languages: [php]
+    severity: WARNING
+    message: >-
+      A request-controlled value reaches an outbound request sink. No validation
+      is modelled by this configuration.
+    metadata:
+      ssrefuse-detector: taint-nosan
+      ssrefuse-lang: php
+    pattern-sources:
+      - pattern: $_GET
+      - pattern: $_POST
+      - pattern: $_REQUEST
+      - pattern: $_COOKIE
+      - pattern: $_SERVER
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: file_get_contents($URL, ...)
+              - pattern: readfile($URL, ...)
+              - pattern: fopen($URL, ...)
+              - pattern: get_headers($URL, ...)
+              - pattern: simplexml_load_file($URL, ...)
+              - pattern: copy($URL, ...)
+              - pattern: stream_socket_client($URL, ...)
+              - pattern: curl_init($URL)
+          - focus-metavariable: $URL
+      # The option write kept in its own block. A URL handed to curl_setopt is
+      # the destination of a request sent by a different statement, so this is
+      # where a PHP curl flow has to be caught.
+      - patterns:
+          - pattern: curl_setopt($CH, CURLOPT_URL, $URL)
+          - focus-metavariable: $URL
+      - patterns:
+          - pattern: fsockopen($HOST, ...)
+          - focus-metavariable: $HOST

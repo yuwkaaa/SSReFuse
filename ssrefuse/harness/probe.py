@@ -138,14 +138,37 @@ class LabProcess:
                                    f"{self.log_path.read_text()[-1500:]}")
             text = self.log_path.read_text()
             for line in text.splitlines():
-                if line.startswith(self.app.ready_marker):
+                if self._marks_ready(line):
                     self.ready_line = line.strip()
                     break
             if self.ready_line and self._port_open():
                 return self._identity()
             time.sleep(0.1)
-        raise RuntimeError(f"lab never printed {self.app.ready_marker!r} on port {self.port}:\n"
-                           f"{self.log_path.read_text()[-1500:]}")
+
+        # The message has to distinguish three states, because the first
+        # version of it could not and said "never printed 'Development
+        # Server'" directly above a log containing that exact string. A
+        # diagnostic that contradicts the evidence it prints is worse than no
+        # diagnostic: it sends the reader to the wrong problem.
+        text = self.log_path.read_text()
+        if self.app.ready_marker in text and not self.ready_line:
+            detail = (f"the marker {self.app.ready_marker!r} IS in the log, but this "
+                      f"app declares ready_match={self.app.ready_match!r} and the "
+                      f"marker is not at the start of a line. Set "
+                      f"ready_match: contains for {self.app.name} in "
+                      f"corpus/ground-truth.yaml")
+        elif self.ready_line:
+            detail = (f"the marker was seen ({self.ready_line!r}) but nothing accepted "
+                      f"a connection on port {self.port}")
+        else:
+            detail = f"the marker {self.app.ready_marker!r} never appeared"
+        raise RuntimeError(f"lab {self.app.name} did not come up on port "
+                           f"{self.port}: {detail}\n{text[-1500:]}")
+
+    def _marks_ready(self, line: str) -> bool:
+        if self.app.ready_match == "contains":
+            return self.app.ready_marker in line
+        return line.startswith(self.app.ready_marker)
 
     def _port_open(self) -> bool:
         try:

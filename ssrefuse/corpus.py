@@ -74,6 +74,15 @@ class App:
     start: list[str]
     ready_marker: str
     framework: str = ""
+    # How the ready marker is matched in the lab's log. "prefix" is the
+    # default and the stricter one: the lab prints the marker itself, at the
+    # start of a line. "contains" exists for a server that prints its own
+    # banner instead -- PHP's built-in server timestamps every line, so its
+    # marker can never be at column zero. Declared per app rather than
+    # loosened for everyone, because `in` would also match a line that merely
+    # quotes the marker, such as an error message about it.
+    ready_match: str = "prefix"
+    min_runtime: str = ""
 
 
 @dataclass
@@ -140,6 +149,8 @@ class Corpus:
         for name, spec in raw.get("apps", {}).items():
             self.apps[name] = App(name=name, lang=spec["lang"], file=spec["file"],
                                   start=spec["start"], ready_marker=spec["ready_marker"],
+                                  ready_match=spec.get("ready_match", "prefix"),
+                                  min_runtime=spec.get("min_runtime", ""),
                                   framework=spec.get("framework", ""))
         self.variants: list[Variant] = []
         self._spans: dict[str, dict[str, tuple[int, int]]] = {}

@@ -1,0 +1,53 @@
+# The same taint rule with the validation shapes a PHP reviewer would reach for
+# declared as sanitizers: parse the URL and compare the hostname, or classify
+# the resolved address with filter_var. Both are necessary and neither is
+# sufficient, so this configuration is expected to lose the variants whose
+# guard has the right shape and the wrong effect. It is included to measure
+# that loss rather than to assert it.
+#
+# PHP makes the point sharper than the other two languages, and it was measured
+# rather than assumed: parse_url() hands back the authority as written, so a
+# hostname comparison it feeds is defeated by every numeric spelling of an
+# address; and filter_var with NO_PRIV_RANGE|NO_RES_RANGE calls 100.64.0.10 and
+# 100.100.100.200 public. Declaring them as sanitizers is therefore declaring
+# two things that do not work -- which is exactly what this tier exists to
+# quantify.
+rules:
+  - id: ssrefuse-php-taint-naive
+    mode: taint
+    languages: [php]
+    severity: WARNING
+    message: >-
+      A request-controlled value reaches an outbound request sink without
+      passing any hostname or address validation this configuration recognises.
+    metadata:
+      ssrefuse-detector: taint-naive
+      ssrefuse-lang: php
+    pattern-sources:
+      - pattern: $_GET
+      - pattern: $_POST
+      - pattern: $_REQUEST
+      - pattern: $_COOKIE
+      - pattern: $_SERVER
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: file_get_contents($URL, ...)
+              - pattern: readfile($URL, ...)
+              - pattern: fopen($URL, ...)
+              - pattern: get_headers($URL, ...)
+              - pattern: simplexml_load_file($URL, ...)
+              - pattern: copy($URL, ...)
+              - pattern: stream_socket_client($URL, ...)
+              - pattern: curl_init($URL)
+          - focus-metavariable: $URL
+      - patterns:
+          - pattern: curl_setopt($CH, CURLOPT_URL, $URL)
+          - focus-metavariable: $URL
+      - patterns:
+          - pattern: fsockopen($HOST, ...)
+          - focus-metavariable: $HOST
+    pattern-sanitizers:
+      - pattern: parse_url(...)
+      - pattern: filter_var(...)
+      - pattern: gethostbyname(...)

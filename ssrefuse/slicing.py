@@ -269,4 +269,7 @@ def slice_source(path: str | Path, line: int, **kwargs) -> CodeSlice:
         return slice_javascript(path, line, **kwargs)
     if path.suffix in (".py", ".pyi"):
         return slice_python(path, line, **kwargs)
+    if path.suffix in (".php", ".phtml"):
+        from ssrefuse.slicing_php import slice_php
+        return slice_php(path, line, **kwargs)
     raise ValueError(f"no slicer for {path.suffix!r} files ({path})")

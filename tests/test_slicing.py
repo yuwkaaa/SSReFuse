@@ -64,12 +64,29 @@ def _javascript_prose(source: str) -> list[str]:
     return out
 
 
-EXTRACTORS = {"python": _python_prose, "javascript": _javascript_prose}
+# PHP is read with the JavaScript scanner on purpose and not by accident: `//`
+# and `/* */` are the same lexical forms in both, so the scanner that finds a
+# comment in one finds it in the other. What it does NOT know about is PHP's
+# third comment form, `#`, and a lab that used it would have that prose
+# silently dropped from the leakage corpus -- a weaker check that still passes.
+# `test_no_lab_uses_a_comment_form_the_scanner_cannot_see` holds that line.
+EXTRACTORS = {"python": _python_prose, "javascript": _javascript_prose,
+              "php": _javascript_prose}
+SUFFIX_LANG = {".py": "python", ".pyi": "python", ".js": "javascript",
+               ".mjs": "javascript", ".cjs": "javascript", ".php": "php"}
 
 
 def _prose_for(path) -> list[str]:
     source = path.read_text()
-    extractor = EXTRACTORS["javascript" if path.suffix == ".js" else "python"]
+    if path.suffix not in SUFFIX_LANG:
+        # Said here rather than defaulted to Python. A new lab language that
+        # fell through to the Python tokenizer would either crash or, worse,
+        # return nothing and quietly leave that lab out of the leakage corpus.
+        raise AssertionError(
+            f"no prose extractor for {path.suffix!r} ({path}). Add one to "
+            f"EXTRACTORS and SUFFIX_LANG; a lab with no extractor is a lab "
+            f"whose docstrings are never checked for leaking the answer.")
+    extractor = EXTRACTORS[SUFFIX_LANG[path.suffix]]
     # Only lines with enough words to be prose; a one-word fragment would match
     # ordinary code by accident.
     return [line.strip() for line in extractor(source) if len(line.split()) >= 5]
@@ -148,3 +165,27 @@ def test_the_dispatcher_refuses_a_language_it_has_no_slicer_for():
     """An unknown extension must not fall through to the Python parser."""
     with pytest.raises(ValueError):
         slice_source(REPO_ROOT / "README.md", 1)
+
+
+@pytest.mark.parametrize("app_file", sorted(PROSE))
+def test_no_lab_uses_a_comment_form_the_scanner_cannot_see(app_file):
+    """The assumption behind reading PHP with the JavaScript scanner.
+
+    PHP also spells a line comment `#`, and the scanner does not know that
+    form. A lab that used it would keep its prose out of the leakage corpus,
+    which makes this whole module quietly weaker while still passing. Checked
+    for every lab rather than only the PHP one, since the next language may
+    share the problem.
+    """
+    source = (REPO_ROOT / app_file).read_text()
+    if app_file.endswith(".py"):
+        return                      # `#` is the only comment form Python has
+    offenders = [
+        number for number, line in enumerate(source.splitlines(), 1)
+        if line.lstrip().startswith("#") and len(line.split()) >= 5
+    ]
+    assert not offenders, (
+        f"{app_file} uses `#` comments on line(s) {offenders}, which the "
+        f"JavaScript comment scanner does not recognise. That prose would be "
+        f"missing from the leakage corpus. Rewrite them as `//`, or teach the "
+        f"scanner the form.")

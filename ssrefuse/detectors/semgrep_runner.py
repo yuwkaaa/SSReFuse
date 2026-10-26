@@ -28,24 +28,38 @@ from ssrefuse.detectors.base import Candidate, DetectorRun
 RULES = REPO_ROOT / "rules" / "semgrep"
 FIXTURES = REPO_ROOT / "tests" / "fixtures"
 
+# One control per language whose rules are loaded, and the check is per file:
+# a tier whose Python rules run and whose PHP rules fail to load still returns
+# a healthy-looking total.
 CONTROL_FILES = [
     FIXTURES / "positive_control_python.py",
     FIXTURES / "positive_control_javascript.js",
+    FIXTURES / "positive_control_php.php",
 ]
 
 DEFAULT_CONFIGS: dict[str, list[Path]] = {
-    "inventory": [RULES / "python-inventory.yaml", RULES / "js-inventory.yaml"],
-    "taint-nosan": [RULES / "python-taint-nosan.yaml", RULES / "js-taint-nosan.yaml"],
-    "taint-naive": [RULES / "python-taint-naive.yaml", RULES / "js-taint-naive.yaml"],
+    "inventory": [RULES / "python-inventory.yaml", RULES / "js-inventory.yaml",
+                  RULES / "php-inventory.yaml"],
+    "taint-nosan": [RULES / "python-taint-nosan.yaml", RULES / "js-taint-nosan.yaml",
+                    RULES / "php-taint-nosan.yaml"],
+    "taint-naive": [RULES / "python-taint-naive.yaml", RULES / "js-taint-naive.yaml",
+                    RULES / "php-taint-naive.yaml"],
 }
 
 # The sink-inventory pass over the static-only corpus is a separate run, with
 # separate targets and separate controls, because what it produces is a
 # different measurement. The labelled corpus is scored for precision and
-# recall against labels the prober reproduced. PHP and Java have no runnable
-# lab here, so they have no such labels, and mixing their findings into that
-# table would be scoring a claim nobody tested. What they can answer without
-# running is "which sinks does the rule see", and that is all this run is for.
+# recall against labels the prober reproduced. What the static-only files can
+# answer without running is "which sinks does the rule see", and that is all
+# this run is for.
+#
+# Java is still in that position: no runnable lab, so no label a prober
+# reproduced, so its findings must not enter the scored table. PHP left it on
+# 2026-10-25 -- `corpus/labs/php_ssrf` runs and is labelled, so the PHP rules
+# are in DEFAULT_CONFIGS above and the PHP lab is scored like the other two.
+# The PHP files under static_only stay here as well, which is not a
+# duplication: one asks what the rule sees, the other asks whether what it saw
+# was true.
 SINK_CONFIGS: list[Path] = [
     RULES / "python-inventory.yaml", RULES / "js-inventory.yaml",
     RULES / "php-inventory.yaml", RULES / "java-inventory.yaml",
