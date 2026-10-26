@@ -220,13 +220,13 @@ report states that those rows are not measurements.
 
 ## Corpus
 
-72 variants, 55 vulnerable and 17 safe, across three labs that implement the same guard taxonomy:
+72 variants, 54 vulnerable and 18 safe, across three labs that implement the same guard taxonomy:
 
 | lab | file | variants | runtime |
 |---|---|---|---|
 | `flask_ssrf` | `corpus/labs/flask_ssrf/app.py` | 28 | Flask, `requests` / `httpx` / `urllib` / curl |
 | `node_ssrf` | `corpus/labs/node_ssrf/app.js` | 28 | Node standard library, `fetch` / `http.get` / curl |
-| `php_ssrf` | `corpus/labs/php_ssrf/app.php` | 16 (13 vulnerable, 3 safe) | PHP built-in server, `file_get_contents` / `curl_exec` |
+| `php_ssrf` | `corpus/labs/php_ssrf/app.php` | 16 (12 vulnerable, 4 safe) | PHP built-in server, `file_get_contents` / `curl_exec` |
 
 Each variant is one route with one guard, from nothing at all (`G0`) to a correct one (`G8`: resolve
 once, classify the address, connect to that same address, refuse redirects). The safe routes in
