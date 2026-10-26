@@ -227,10 +227,35 @@ def ablation_table(arms, corpus, runs, dyn) -> str:
     if not arms:
         return "No judge run on disk."
 
+    from ssrefuse.llm.client import thinking_control
+
     rows = []
+    # A capped run is not comparable with a full one -- the judge says so when
+    # it writes one -- and the comparison is exactly what this table is. A
+    # precision computed over two locations sitting in the same column as one
+    # computed over fifty is the cheapest wrong conclusion on offer here, so
+    # samples come out of the table and are listed under it by name instead of
+    # being dropped in silence.
+    samples = []
+    # An arm that did not run at the budget its name claims still produces a
+    # full, plausible set of verdict columns, so it has to be taken out by
+    # name rather than spotted. Arms written before this check existed are
+    # checked here from what they recorded, which is the point of recording
+    # the token counts in the first place.
+    failed_control = []
     for name, payload, judgements in arms:
         client = payload.get("client", {})
         if client.get("is_mock"):
+            continue
+        if payload.get("is_sample"):
+            samples.append((name, payload))
+            continue
+        control = payload.get("thinking_control") or thinking_control(
+            payload.get("reasoning_effort", client.get("reasoning_effort", "")),
+            client.get("reasoning_tokens", 0),
+            client.get("usage_reported", True))
+        if control["status"] == "FAILED":
+            failed_control.append((name, payload, control))
             continue
         strategies = {s.name: s for s in run_strategies(corpus, runs, judgements, dyn)}
         llm = strategies.get("llm_only")
@@ -261,6 +286,7 @@ def ablation_table(arms, corpus, runs, dyn) -> str:
             slot["r"] = f"{slot['tp'] / real:.3f}" if real else "n/a"
 
         rows.append({
+            "control": control,
             "per_language": per_language,
             "false_positives": sorted(v.id for v in corpus.variants
                                       if v.id in flagged and v.label == "safe"),
@@ -272,6 +298,10 @@ def ablation_table(arms, corpus, runs, dyn) -> str:
             "tin": client.get("tokens_in", 0),
             "tout": client.get("tokens_out", 0),
             "think": client.get("reasoning_tokens", 0),
+            # Older payloads predate the flag and did come from a transport
+            # that accounted for itself, so absent means reported here.
+            "usage_reported": client.get("usage_reported", True),
+            "transport": client.get("transport", "chat-completions"),
             "seconds": payload.get("duration_s"),
             "vuln": counts.get("vulnerable", 0),
             "safe": counts.get("safe", 0),
@@ -283,8 +313,42 @@ def ablation_table(arms, corpus, runs, dyn) -> str:
             "sample": payload.get("is_sample", False),
             "judged": payload.get("candidates_judged", len(judgements)),
         })
+    def _control_note() -> list[str]:
+        """Arms whose own numbers contradict their label."""
+        if not failed_control:
+            return []
+        lines = ["", f"**Excluded: {len(failed_control)} arm(s) failed the thinking "
+                 "control.** The thinking budget an arm is named after is a claim, "
+                 "and the provider's own token accounting is the evidence. An arm "
+                 "that did not run at its named budget is not a weaker arm, it is a "
+                 "different measurement wearing the wrong label, and nothing in the "
+                 "verdict columns would reveal it.", ""]
+        for name, payload, control in sorted(failed_control):
+            lines.append(f"- `{name}` -- {control['detail']}")
+        return lines
+
+    def _samples_note() -> list[str]:
+        if not samples:
+            return []
+        lines = ["", "**Left out of the tables above: "
+                 f"{len(samples)} capped run(s).** `--limit` judges the first N "
+                 "candidates in a fixed order, which is for trying a prompt change "
+                 "cheaply and not for comparing. They are named here because an "
+                 "arm that silently vanished from a report invites the guess that "
+                 "it was never run.", ""]
+        for name, payload in sorted(samples):
+            client = payload.get("client", {})
+            lines.append(
+                f"- `{name}` -- {client.get('provider', '?')} "
+                f"`{client.get('model', '?')}` at effort "
+                f"`{payload.get('reasoning_effort', '?')}`, judged "
+                f"{payload.get('candidates_judged', '?')} of "
+                f"{payload.get('candidates_available', '?')} candidates")
+        return lines
+
     if not rows:
-        return "Only mock runs on disk, so there is nothing to compare."
+        return "\n".join(["No arm on disk is usable for a comparison."]
+                          + _control_note() + _samples_note())
 
     def _at(file: str, line: int) -> tuple[str, int]:
         """Normalise both sides the same way, or nothing ever matches.
@@ -340,25 +404,47 @@ def ablation_table(arms, corpus, runs, dyn) -> str:
         cas_j = r["cascade"].scores_judge_decided if r["cascade"] else None
         lines.append(f"| `{r['effort']}` | {fmt(llm_s)} | {fmt(cas_s)} | {fmt(cas_j)} |")
 
-    lines += ["", "**What each arm cost.**", "",
-              "| thinking | calls | tokens in | tokens out | of which reasoning | seconds |",
-              "|---|---|---|---|---|---|"]
+    lines += ["", "**What each arm cost.** `n/a` is not zero: an arm reached through",
+              "an agent transport gets its answer and no accounting with it, so the",
+              "token columns are blank rather than filled with a number nobody",
+              "measured. Calls and seconds are counted locally and hold either way.", "",
+              "| thinking | transport | calls | tokens in | tokens out | of which reasoning | seconds |",
+              "|---|---|---|---|---|---|---|"]
     for r in rows:
         secs = f"{r['seconds']:.0f}" if r["seconds"] else "not recorded"
-        lines.append(f"| `{r['effort']}` | {r['calls']} | {r['tin']:,} | {r['tout']:,} "
-                     f"| {r['think']:,} | {secs} |")
+        if r["usage_reported"]:
+            tin, tout, think = f"{r['tin']:,}", f"{r['tout']:,}", f"{r['think']:,}"
+        else:
+            tin = tout = think = "n/a"
+        lines.append(f"| `{r['effort']}` | `{r['transport']}` | {r['calls']} | {tin} "
+                     f"| {tout} | {think} | {secs} |")
 
-    base = next((r for r in rows if r["effort"] in ("off", "none")), None)
+    # The cost comparison needs both sides to have been accounted for. One arm
+    # on an agent transport and one on a vendor API cannot be divided, and a
+    # ratio against an unreported zero would print 0.0 and read as "free".
+    base = next((r for r in rows
+                 if r["effort"] in ("off", "none") and r["usage_reported"]), None)
     if base and len(rows) > 1:
         for r in rows:
             if r is base:
                 continue
-            factor = r["tout"] / base["tout"] if base["tout"] else 0
             moved = r["vuln"] - base["vuln"]
+            if not r["usage_reported"]:
+                lines += ["",
+                          f"Against the `{base['effort']}` arm, `{r['effort']}` changed "
+                          f"the vulnerable count by {moved:+d}. What it cost in tokens is "
+                          f"not comparable: it ran on the `{r['transport']}` transport, "
+                          f"which reports no usage."]
+                continue
+            factor = r["tout"] / base["tout"] if base["tout"] else 0
             lines += ["",
                       f"Against the `{base['effort']}` arm, `{r['effort']}` changed the "
                       f"vulnerable count by {moved:+d} and spent {factor:.1f} times the "
                       f"output tokens."]
+    elif len(rows) > 1:
+        lines += ["",
+                  "No arm with a token accounting ran at `off` or `none`, so there is no "
+                  "baseline to divide by and no cost ratio is printed."]
     lines += ["", "**Split by language**, because the JavaScript slicer is a character",
               "scanner and the Python one walks an AST. A single row would hide which",
               "half carries the error.", "",
@@ -379,7 +465,22 @@ def ablation_table(arms, corpus, runs, dyn) -> str:
     lines += ["",
               "`off` disables thinking and is the real non-thinking arm. `none` would send",
               "no parameter at all, which was measured to leave thinking ON by default, so",
-              "it is not a baseline and is not used as one here."]
+              "it is not a baseline and is not used as one here. On the opencode",
+              "transport the budget is a declared model variant and `off` has none, so",
+              "that arm cannot be run there at all."]
+    unchecked = [r for r in rows if r["control"]["status"] == "not_checked"]
+    if unchecked:
+        lines += ["",
+                  f"**{len(unchecked)} of these arms could not be checked against "
+                  f"their own label** ("
+                  + ", ".join(f"`{r['effort']}` on `{r['transport']}`"
+                              for r in unchecked)
+                  + "). The transport returned no token accounting, so what budget "
+                    "the model actually thought at is unknown rather than zero. The "
+                    "rows stand as verdicts; they do not stand as evidence about the "
+                    "budget."]
+    lines += _control_note()
+    lines += _samples_note()
     return "\n".join(lines)
 
 

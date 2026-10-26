@@ -189,7 +189,12 @@ def cmd_judge(args) -> int:
                      strip_comments=not args.keep_comments)
     judgements = judge.judge_candidates(candidates, corpus)
 
-    payload = {"client": client.describe(),
+    described = client.describe()
+    payload = {"client": described,
+               # Lifted out of `client` as well, because this is the line that
+               # decides whether the arm's rows mean anything and a reader
+               # should not have to go looking for it.
+               "thinking_control": described["thinking_control"],
                "candidates_from": args.candidates_from,
                "candidates_judged": len(candidates),
                "candidates_available": len(source.candidates),
@@ -224,11 +229,47 @@ def cmd_judge(args) -> int:
     if refused:
         print(f"{len(refused)} call(s) had to drop response_format and parse JSON "
               f"out of prose; the endpoint refused json mode")
-    thinking = sum(j.reasoning_tokens for j in judgements)
-    if thinking:
-        print(f"reasoning tokens at effort={args.effort}: {thinking}")
-    print(f"client: {client.describe()}")
+    # The mock provider reports no usage either, but for the opposite reason:
+    # it called nothing, so zero is the true answer and the warning above
+    # already says the rows are not measurements. Claiming the counters are
+    # merely unknown there would be the one wrong thing to say about a mock.
+    if not described["usage_reported"] and not client.is_mock:
+        print(f"token usage: NOT REPORTED by the {described['transport']} "
+              f"transport. The counters in the payload are zero because "
+              f"nothing told us otherwise, not because the run was free of "
+              f"tokens; the cost table prints n/a for this arm.")
+        if not described["temperature_sent"]:
+            print(f"temperature: --temperature {args.temperature} was NOT sent. "
+                  f"This transport takes no temperature, so the arm ran at the "
+                  f"provider's default.")
+        if not described["capabilities"]["json_mode"]:
+            print("json mode: NOT AVAILABLE on this transport. The answer was "
+                  "parsed out of whatever the model returned, so compare the "
+                  "parse-error count against a chat-completions arm before "
+                  "reading a difference in verdicts as a difference in ability.")
+    else:
+        thinking = sum(j.reasoning_tokens for j in judgements)
+        if thinking:
+            print(f"reasoning tokens at effort={args.effort}: {thinking}")
+    print(f"client: {described}")
     print(f"wrote {arm_path}")
+
+    # The control, last and loudest. An arm named after a thinking budget it
+    # did not run at produces a complete, plausible set of verdict columns,
+    # so nothing downstream would notice -- which is why this exits non-zero
+    # rather than printing a warning. The payload is written first either way:
+    # a run that has already been paid for should not be thrown away, it
+    # should be marked.
+    control = described["thinking_control"]
+    if control["status"] == "FAILED":
+        print(f"THINKING CONTROL FAILED: {control['detail']}", file=sys.stderr)
+        print(f"{arm_path.name} is on disk and carries the failure; the report "
+              f"leaves it out of the comparison and names it.", file=sys.stderr)
+        return 1
+    if control["status"] == "not_checked":
+        print(f"thinking control: NOT CHECKED. {control['detail']}")
+    else:
+        print(f"thinking control: {control['status']} -- {control['detail']}")
     return 0
 
 
@@ -430,16 +471,27 @@ def main(argv: list[str] | None = None) -> int:
 
     judge = sub.add_parser("judge", help="run the LLM judge over static candidates")
     judge.add_argument("--provider", default="deepseek",
-                       help="deepseek (default), openrouter, openai-compatible, or mock")
+                       help="deepseek (default), openrouter, openai-compatible, "
+                            "opencode, or mock. The first three call a vendor "
+                            "API with a key; opencode hands the prompt to a "
+                            "locally running opencode server, which spends the "
+                            "account's own subscription and needs no key here, "
+                            "at the cost of reporting no token usage")
     judge.add_argument("--model", default=None,
                        help="provider default if omitted; deepseek-flash or "
-                            "deepseek-v4-pro for the deepseek provider")
+                            "deepseek-v4-pro for the deepseek provider, and "
+                            "`provider/model` as `opencode models` prints it "
+                            "for the opencode provider, e.g. "
+                            "opencode-go/deepseek-v4.1-flash")
     judge.add_argument("--effort", default="none", choices=REASONING_EFFORTS,
                        help="thinking budget. 'off' disables thinking; 'none' "
                             "sends no parameter and takes the provider default, "
                             "which was measured to be thinking ON, so 'none' is "
                             "not a non-thinking arm. The ablation is one model "
-                            "with the thinking budget moved: off vs high.")
+                            "with the thinking budget moved: off vs high. On "
+                            "the opencode transport the budget is a declared "
+                            "model variant and there is no 'off' variant, so "
+                            "that arm needs --provider deepseek.")
     judge.add_argument("--rounds", type=int, default=2,
                        help="maximum rounds; >1 lets the judge ask for more code")
     judge.add_argument("--candidates-from", default="inventory",
@@ -467,7 +519,8 @@ def main(argv: list[str] | None = None) -> int:
     every.add_argument("-o", "--output")
     every.add_argument("--with-judge", action="store_true",
                        help="also run the LLM judge (needs an API key)")
-    every.add_argument("--provider", default="deepseek")
+    every.add_argument("--provider", default="deepseek",
+                       help="see `judge --help`; opencode needs no key")
     every.add_argument("--model", default=None)
     every.add_argument("--effort", default="none", choices=REASONING_EFFORTS)
     every.add_argument("--rounds", type=int, default=2)

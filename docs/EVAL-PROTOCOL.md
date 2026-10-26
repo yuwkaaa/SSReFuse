@@ -226,6 +226,15 @@ precision it did not earn.
 ## Timing and provenance
 
 The host clock runs at UTC-04:00. Timestamps in `results/` are local to the measuring machine.
-Model answers are cached on disk keyed by provider, model, temperature and the exact prompt text, so
-re-running the evaluation does not produce different numbers from resampling, and a changed prompt
-cannot be scored against answers to the previous one.
+Model answers are cached on disk keyed by provider, model, temperature, thinking budget and the
+exact prompt text, so re-running the evaluation does not produce different numbers from resampling,
+and a changed prompt cannot be scored against answers to the previous one. The budget is in the key
+because the same prompt at a different budget is a different measurement, and serving one arm from
+the other's cache would collapse the ablation into a single column.
+
+One caveat belongs with that list. Temperature is in the key whether or not the transport sent it:
+the opencode transport takes no temperature, so two runs at different `--temperature` values make
+the same request and still get separate cache entries. That direction is the safe one -- it buys a
+redundant call, not a wrong number -- but a cached answer from that transport is an answer at the
+provider's default temperature, which is what `temperature_sent: false` in the results payload
+records.
